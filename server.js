@@ -25,12 +25,15 @@ app.get('/', (req, res) => {
 });
 
 const projectRoutes = require('./routes/project.routes');
-const authRoutes = require('./routes/auth.routes'); // เพิ่ม Auth Routes
+const authRoutes = require('./routes/auth.routes');
+const adminRoutes = require('./routes/admin.routes');
 
 // บอกแอปว่า ถ้า URL ขึ้นต้นด้วย /api/projects ให้ไปดูไฟล์ projectRoutes
 app.use('/api/projects', projectRoutes);
 // ถ้า URL ขึ้นต้นด้วย /api/auth ให้ไปดูไฟล์ authRoutes (login, signup)
 app.use('/api/auth', authRoutes);
+// Admin routes (ต้องการสิทธิ์ Admin)
+app.use('/api/admin', adminRoutes);
 
 
 // ตั้งค่า Port และ Start Server

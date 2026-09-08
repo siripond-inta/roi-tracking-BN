@@ -20,17 +20,17 @@ exports.getAllProjects = async (req, res) => {
         p.duration_months, 
         p.initial_budget,
         p.user_id,
+        p.is_public,
+        p.custom_project_type,
         p.created_at,
         pt.type_name AS project_type,
-        -- คำนวณ status จาก project_ledger.phase
-        -- ถ้ามี record phase='Actual' อยู่ → สถานะ='Actual' ไม่งั้นเป็น 'Estimated'
         CASE WHEN EXISTS(
           SELECT 1 FROM project_ledger pl 
           WHERE pl.project_id = p.project_id AND pl.phase = 'Actual'
         ) THEN 'Actual' ELSE 'Estimated' END AS status
       FROM projects p
       LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
-      WHERE p.user_id = ?            -- กรองเฉพาะโปรเจกต์ของ user คนนี้
+      WHERE p.user_id = ?
       ORDER BY p.created_at DESC
     `;
 
@@ -95,11 +95,8 @@ exports.getProjectById = async (req, res) => {
 // ══════════════════════════════════════════════════════════
 exports.createProject = async (req, res) => {
   try {
-    const { project_name, project_type_id, duration_months, initial_budget } = req.body;
+    const { project_name, project_type_id, duration_months, initial_budget, custom_project_type } = req.body;
 
-    // ── Security Fix #3 ─────────────────────────────────────────────────────
-    // ดึง user_id จาก JWT token ที่ถูก decode ใน verifyToken middleware
-    // ลบ '|| 1' fallback เดิมออก — ถ้าไม่มี userId ใน token หมายถึง token ผิดปกติ
     const user_id = req.user?.userId;
     if (!user_id) {
       return res.status(401).json({ status: 'error', message: 'Unauthorized: ไม่พบข้อมูล User' });
@@ -109,17 +106,15 @@ exports.createProject = async (req, res) => {
       return res.status(400).json({ status: 'error', message: 'กรุณากรอกข้อมูลให้ครบ' });
     }
 
-    // ตาราง projects ไม่มี AUTO_INCREMENT จึงต้องหา ID ถัดไปด้วย MAX() + 1
-    // COALESCE(MAX, 100): ถ้าตารางว่าง ให้เริ่มต้นที่ 101
     const [[{ maxId }]] = await db.query(
       'SELECT COALESCE(MAX(project_id), 100) AS maxId FROM projects'
     );
     const newProjectId = maxId + 1;
 
     await db.query(
-      `INSERT INTO projects (project_id, user_id, project_name, project_type_id, duration_months, initial_budget)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [newProjectId, user_id, project_name, project_type_id || 1, duration_months || 12, initial_budget]
+      `INSERT INTO projects (project_id, user_id, project_name, project_type_id, duration_months, initial_budget, custom_project_type)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [newProjectId, user_id, project_name, project_type_id || 1, duration_months || 12, initial_budget, custom_project_type || null]
     );
 
     res.status(201).json({
@@ -299,5 +294,129 @@ exports.saveLedgers = async (req, res) => {
   } catch (error) {
     console.error('[Project] saveLedgers Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to save ledgers' });
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 7. PATCH /api/projects/:id/visibility — สลับ Public/Private
+// ══════════════════════════════════════════════════════════
+exports.toggleVisibility = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const { is_public } = req.body;
+
+    // ตรวจ ownership
+    const [[project]] = await db.query(
+      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
+      [id, userId]
+    );
+    if (!project) {
+      return res.status(404).json({ status: 'error', message: 'Project not found' });
+    }
+
+    await db.query(
+      'UPDATE projects SET is_public = ? WHERE project_id = ?',
+      [is_public ? 1 : 0, id]
+    );
+
+    res.json({
+      status: 'success',
+      message: is_public ? 'เปลี่ยนสถานะเป็นสาธารณะแล้ว' : 'เปลี่ยนสถานะเป็นส่วนตัวแล้ว'
+    });
+  } catch (error) {
+    console.error('[Project] toggleVisibility Error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to update visibility' });
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 8. PUT /api/projects/:id/ledgers/estimated — อัปเดต Estimated Ledger
+// ══════════════════════════════════════════════════════════
+exports.updateEstimatedLedgers = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const { ledgers } = req.body;
+
+    // ตรวจ ownership และยังไม่มี Actual
+    const [[project]] = await db.query(
+      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
+      [id, userId]
+    );
+    if (!project) {
+      return res.status(404).json({ status: 'error', message: 'Project not found' });
+    }
+
+    // ตรวจว่ามี Actual แล้วหรือยัง (ถ้ามีแล้วห้ามแก้ Estimated)
+    const [[{ hasActual }]] = await db.query(
+      'SELECT COUNT(*) AS hasActual FROM project_ledger WHERE project_id = ? AND phase = "Actual"',
+      [id]
+    );
+    if (hasActual > 0) {
+      return res.status(400).json({ status: 'error', message: 'ไม่สามารถแก้ไข Estimated ได้ เนื่องจากมีข้อมูล Actual แล้ว' });
+    }
+
+    // ลบ Estimated เก่าทั้งหมดแล้ว insert ใหม่
+    await db.query('DELETE FROM project_ledger WHERE project_id = ? AND phase = "Estimated"', [id]);
+
+    if (ledgers && ledgers.length > 0) {
+      const [[{ maxId }]] = await db.query('SELECT COALESCE(MAX(ledger_id), 0) AS maxId FROM project_ledger');
+      let nextId = maxId + 1;
+      const today = new Date().toISOString().split('T')[0];
+
+      for (const item of ledgers) {
+        await db.query(
+          `INSERT INTO project_ledger (ledger_id, project_id, phase, type_id, category_id, total_value, transaction_date, note)
+           VALUES (?, ?, 'Estimated', ?, ?, ?, ?, ?)`,
+          [nextId++, id, item.type_id, item.category_id, item.total_value, item.transaction_date || today, item.note || '']
+        );
+      }
+    }
+
+    res.json({ status: 'success', message: 'อัปเดต Estimated สำเร็จ' });
+  } catch (error) {
+    console.error('[Project] updateEstimatedLedgers Error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to update ledgers' });
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 9. PUT /api/projects/:id/ledgers/actual — อัปเดต Actual Ledger
+// ══════════════════════════════════════════════════════════
+exports.updateActualLedgers = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+    const { ledgers } = req.body;
+
+    const [[project]] = await db.query(
+      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
+      [id, userId]
+    );
+    if (!project) {
+      return res.status(404).json({ status: 'error', message: 'Project not found' });
+    }
+
+    await db.query('DELETE FROM project_ledger WHERE project_id = ? AND phase = "Actual"', [id]);
+
+    if (ledgers && ledgers.length > 0) {
+      const [[{ maxId }]] = await db.query('SELECT COALESCE(MAX(ledger_id), 0) AS maxId FROM project_ledger');
+      let nextId = maxId + 1;
+      const today = new Date().toISOString().split('T')[0];
+
+      for (const item of ledgers) {
+        await db.query(
+          `INSERT INTO project_ledger (ledger_id, project_id, phase, type_id, category_id, total_value, transaction_date, note)
+           VALUES (?, ?, 'Actual', ?, ?, ?, ?, ?)`,
+          [nextId++, id, item.type_id, item.category_id, item.total_value, item.transaction_date || today, item.note || '']
+        );
+      }
+    }
+
+    res.json({ status: 'success', message: 'อัปเดต Actual สำเร็จ' });
+  } catch (error) {
+    console.error('[Project] updateActualLedgers Error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to update actual ledgers' });
   }
 };

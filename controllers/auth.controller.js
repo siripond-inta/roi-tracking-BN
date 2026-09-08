@@ -10,7 +10,7 @@ const jwt = require('jsonwebtoken');
 // ─────────────────────────────────────────────
 exports.signup = async (req, res) => {
   try {
-    const { full_name, email, password } = req.body;
+    const { full_name, email, password, company_name } = req.body;
 
     // 1. ตรวจสอบว่ากรอกข้อมูลครบหรือไม่
     if (!full_name || !email || !password) {
@@ -32,8 +32,8 @@ exports.signup = async (req, res) => {
 
     // 4. บันทึก user ใหม่ลงฐานข้อมูล โดยให้ role = 'user' เป็น default
     await db.query(
-      'INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, ?)',
-      [full_name, email, password_hash, 'user']
+      'INSERT INTO users (full_name, email, password_hash, role, company_name) VALUES (?, ?, ?, ?, ?)',
+      [full_name, email, password_hash, 'user', company_name || null]
     );
 
     res.status(201).json({ message: 'สมัครสมาชิกสำเร็จ! กรุณา Login' });
@@ -96,7 +96,8 @@ exports.login = async (req, res) => {
         userId: user.user_id,
         fullName: user.full_name,
         email: user.email,
-        role: user.role
+        role: user.role,
+        companyName: user.company_name || ''
       }
     });
 
