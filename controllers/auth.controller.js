@@ -10,7 +10,8 @@ const jwt = require('jsonwebtoken');
 // ─────────────────────────────────────────────
 exports.signup = async (req, res) => {
   try {
-    const { full_name, email, password, company_name } = req.body;
+    // หมายเหตุ: schema v1.2 ไม่มีคอลัมน์ users.company_name แล้ว (ถ้า frontend ส่งมาจะถูกละเว้น)
+    const { full_name, email, password } = req.body;
 
     // 1. ตรวจสอบว่ากรอกข้อมูลครบหรือไม่
     if (!full_name || !email || !password) {
@@ -30,10 +31,10 @@ exports.signup = async (req, res) => {
     // saltRounds = 10 หมายถึง hash ซ้ำ 2^10 = 1024 รอบ (ยิ่งมากยิ่งปลอดภัย แต่ช้ากว่า)
     const password_hash = await bcrypt.hash(password, 10);
 
-    // 4. บันทึก user ใหม่ลงฐานข้อมูล โดยให้ role = 'user' เป็น default
+    // 4. บันทึก user ใหม่ลงฐานข้อมูล โดยให้ role = 'project_owner' เป็น default สำหรับผู้ที่สมัครเอง
     await db.query(
-      'INSERT INTO users (full_name, email, password_hash, role, company_name) VALUES (?, ?, ?, ?, ?)',
-      [full_name, email, password_hash, 'user', company_name || null]
+      'INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, ?)',
+      [full_name, email, password_hash, 'project_owner']
     );
 
     res.status(201).json({ message: 'สมัครสมาชิกสำเร็จ! กรุณา Login' });
@@ -77,6 +78,14 @@ exports.login = async (req, res) => {
       return res.status(401).json({ message: 'Email หรือ Password ไม่ถูกต้อง' });
     }
 
+    // 3.5. บัญชีที่ถูก admin ปิดใช้งาน (soft delete) แล้ว ห้าม login
+    if (!user.is_active) {
+      return res.status(403).json({ message: 'บัญชีนี้ถูกปิดใช้งานแล้ว กรุณาติดต่อผู้ดูแลระบบ' });
+    }
+
+    // บันทึกเวลา login ล่าสุด ใช้ตรวจสอบบัญชีที่ไม่ได้ใช้งานนาน (ฟีเจอร์ soft delete ของ admin)
+    await db.query('UPDATE users SET last_login_at = NOW() WHERE user_id = ?', [user.user_id]);
+
     // 4. สร้าง JWT Token โดย sign ด้วย JWT_SECRET
     // Payload ที่แนบไปใน token: userId, email, role (ข้อมูลที่ Guard จะอ่านได้)
     const token = jwt.sign(
@@ -96,13 +105,105 @@ exports.login = async (req, res) => {
         userId: user.user_id,
         fullName: user.full_name,
         email: user.email,
-        role: user.role,
-        companyName: user.company_name || ''
+        role: user.role
       }
     });
 
   } catch (error) {
     console.error('[Auth] Login Error:', error);
+    res.status(500).json({ message: 'เกิดข้อผิดพลาดที่ Server กรุณาลองใหม่' });
+  }
+};
+
+// ─────────────────────────────────────────────
+// PUT /api/auth/profile — แก้ไขชื่อ/อีเมลของตัวเอง
+// ─────────────────────────────────────────────
+exports.updateProfile = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { full_name, email, current_password } = req.body;
+
+    if (!full_name || !full_name.trim()) {
+      return res.status(400).json({ message: 'กรุณากรอกชื่อ' });
+    }
+
+    const [[user]] = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);
+    if (!user) {
+      return res.status(404).json({ message: 'ไม่พบผู้ใช้' });
+    }
+
+    const emailChanged = email && email.trim() !== user.email;
+
+    // เปลี่ยนอีเมลต้องยืนยันด้วยรหัสผ่านปัจจุบัน (ป้องกันคนอื่นแอบเปลี่ยนถ้า session หลุด)
+    if (emailChanged) {
+      if (!current_password) {
+        return res.status(400).json({ message: 'กรุณากรอกรหัสผ่านปัจจุบันเพื่อยืนยันการเปลี่ยนอีเมล' });
+      }
+      const isMatch = await bcrypt.compare(current_password, user.password_hash);
+      if (!isMatch) {
+        return res.status(401).json({ message: 'รหัสผ่านปัจจุบันไม่ถูกต้อง' });
+      }
+
+      const [existing] = await db.query(
+        'SELECT user_id FROM users WHERE email = ? AND user_id <> ?',
+        [email.trim(), userId]
+      );
+      if (existing.length > 0) {
+        return res.status(409).json({ message: 'อีเมลนี้ถูกใช้งานโดยบัญชีอื่นแล้ว' });
+      }
+    }
+
+    await db.query(
+      'UPDATE users SET full_name = ?, email = ? WHERE user_id = ?',
+      [full_name.trim(), emailChanged ? email.trim() : user.email, userId]
+    );
+
+    res.json({
+      message: 'บันทึกข้อมูลโปรไฟล์สำเร็จ',
+      user: {
+        userId: user.user_id,
+        fullName: full_name.trim(),
+        email: emailChanged ? email.trim() : user.email,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    console.error('[Auth] updateProfile Error:', error);
+    res.status(500).json({ message: 'เกิดข้อผิดพลาดที่ Server กรุณาลองใหม่' });
+  }
+};
+
+// ─────────────────────────────────────────────
+// PUT /api/auth/password — เปลี่ยนรหัสผ่านของตัวเอง
+// ─────────────────────────────────────────────
+exports.changePassword = async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { current_password, new_password } = req.body;
+
+    if (!current_password || !new_password) {
+      return res.status(400).json({ message: 'กรุณากรอกรหัสผ่านปัจจุบันและรหัสผ่านใหม่' });
+    }
+    if (new_password.length < 6) {
+      return res.status(400).json({ message: 'รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร' });
+    }
+
+    const [[user]] = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);
+    if (!user) {
+      return res.status(404).json({ message: 'ไม่พบผู้ใช้' });
+    }
+
+    const isMatch = await bcrypt.compare(current_password, user.password_hash);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'รหัสผ่านปัจจุบันไม่ถูกต้อง' });
+    }
+
+    const newHash = await bcrypt.hash(new_password, 10);
+    await db.query('UPDATE users SET password_hash = ? WHERE user_id = ?', [newHash, userId]);
+
+    res.json({ message: 'เปลี่ยนรหัสผ่านสำเร็จ' });
+  } catch (error) {
+    console.error('[Auth] changePassword Error:', error);
     res.status(500).json({ message: 'เกิดข้อผิดพลาดที่ Server กรุณาลองใหม่' });
   }
 };
