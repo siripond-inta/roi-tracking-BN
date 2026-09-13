@@ -1,0 +1,110 @@
+# Backend stack: MySQL + one-off migration/seed jobs + the Express API.
+#
+# `name:` below sets the Compose *project* name. roi-tracking-FN's docker-compose.yml declares
+# the same project name, so even though they're two separate repos started with two separate
+# `docker compose up` commands, Docker Desktop groups both under a single "roi-tracking" stack,
+# and both share the same default network (roi-tracking_default) — handy if you ever want the
+# frontend container to reach the backend by service name instead of via localhost.
+name: roi-tracking
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: roi-tracking-backend-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DOCKER_DB_USER}
+      MYSQL_PASSWORD: ${DOCKER_DB_PASSWORD}
+    ports:
+      - "${DOCKER_DB_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # --protocol=tcp (not the unix socket) matters: on first-time init, mysql briefly runs a
+      # temporary server that only listens on the socket, which would otherwise make this
+      # healthcheck report "healthy" a moment before the real server (reachable by other
+      # containers over TCP) is actually up, causing migrate/seed to hit ECONNREFUSED.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--protocol=tcp", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # One-off job: applies Drizzle migrations, then exits (Exited (0) is success, not an error).
+  # This is what creates all the tables — no more manual table creation via phpMyAdmin.
+  # Runs automatically every `docker compose up` (it's a no-op if there's nothing new to apply).
+  migrate:
+    build:
+      context: .
+    image: roi-tracking-backend:latest
+    container_name: roi-tracking-backend-migrate
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: ${DOCKER_DB_USER}
+      DB_PASSWORD: ${DOCKER_DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+    command: ["npx", "drizzle-kit", "migrate"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  # One-off job, NOT run automatically by `docker compose up` (no other service depends on it).
+  # Wipes and re-inserts mock data in every table. Run it explicitly when you want fresh sample
+  # data: `docker compose run --rm seed`.
+  seed:
+    build:
+      context: .
+    image: roi-tracking-backend:latest
+    container_name: roi-tracking-backend-seed
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: ${DOCKER_DB_USER}
+      DB_PASSWORD: ${DOCKER_DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+    command: ["node", "db/seed.js"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+    profiles: ["tools"] # excluded from a plain `docker compose up`; run via `docker compose run --rm seed`
+
+  # NOT run automatically by a plain `docker compose up` (see profiles below) — while actively
+  # developing, run the API locally with `npm run dev` instead (fast reload, no rebuild needed)
+  # against this same dockerized mysql. Use this service when you want to test the fully
+  # containerized stack: `docker compose --profile full up -d`.
+  backend:
+    build:
+      context: .
+    image: roi-tracking-backend:latest
+    container_name: roi-tracking-backend-api
+    restart: unless-stopped
+    profiles: ["full"]
+    environment:
+      PORT: 3000
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: ${DOCKER_DB_USER}
+      DB_PASSWORD: ${DOCKER_DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      JWT_SECRET: ${JWT_SECRET}
+    ports:
+      - "${DOCKER_BACKEND_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  mysql_data:
