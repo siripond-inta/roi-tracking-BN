@@ -14,10 +14,13 @@ router.get('/projects', verifyAdmin, adminController.getAllProjects);
 // GET /api/admin/users — ดู User ทั้งหมด
 router.get('/users', verifyAdmin, adminController.getAllUsers);
 
-// PUT /api/admin/users/:id — แก้ไข User (role, company_name, full_name)
+// PUT /api/admin/users/:id — แก้ไข User (role, full_name)
 router.put('/users/:id', verifyAdmin, adminController.updateUser);
 
-// DELETE /api/admin/users/:id — ลบ User
+// PATCH /api/admin/users/:id/deactivate — Soft delete บัญชีที่ไม่ active เกิน 3 ปี
+router.patch('/users/:id/deactivate', verifyAdmin, adminController.softDeleteUser);
+
+// DELETE /api/admin/users/:id — ลบ User (hard delete)
 router.delete('/users/:id', verifyAdmin, adminController.deleteUser);
 
 module.exports = router;
