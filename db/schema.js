@@ -59,6 +59,12 @@ const categories = mysqlTable('categories', {
   categoryName: varchar('category_name', { length: 255 }).notNull(),
   typeId: int('type_id').references(() => entryTypes.typeId),
   categoryGroup: mysqlEnum('category_group', ['INV', 'OPC', 'ADC', 'BEN']).notNull(),
+  // เพิ่มนอกเหนือจาก DBML เดิม (v1.2) — รองรับการตีมูลค่าประโยชน์ทางอ้อม (FR03-4) ที่คิดจาก
+  // "ปริมาณที่ลดได้ × อัตราต่อหน่วย" โดยแต่ละหมวดใช้หน่วยคนละแบบ (ชั่วโมง/ชุด/ครั้ง)
+  // เก็บชื่อหน่วยไว้ใน database ให้ฟอร์มดึงไปแสดงเอง ไม่ต้อง hardcode ใน frontend
+  // null = หมวดหมู่ปกติที่กรอกยอดเงินตรงๆ ไม่ใช่แบบ qty × rate
+  unitLabel: varchar('unit_label', { length: 100 }),
+  rateLabel: varchar('rate_label', { length: 100 }),
 });
 
 // ── projects ──────────────────────────────────────────────

@@ -15,6 +15,13 @@
       "when": 1789244021226,
       "tag": "0001_bored_umar",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1789889153784,
+      "tag": "0002_living_morlun",
+      "breakpoints": true
     }
   ]
 }

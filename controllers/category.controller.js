@@ -4,7 +4,8 @@
 const db = require('../config/db.config');
 
 // สร้างรหัสหมวดหมู่อัตโนมัติ — admin ไม่ต้องคิด/พิมพ์รหัสเอง
-// รูปแบบยึดตามข้อมูลเดิม: รายรับ = REVxxx, รายจ่าย = CATxxx (เลขวิ่งต่อจากตัวที่มากสุดของ prefix นั้น)
+// FR03-3: รหัสใช้กลุ่มค่าใช้จ่ายเป็น prefix เพื่อให้จำแนกได้ในตัวเอง —
+// INVxxx (เงินลงทุน), OPCxxx (ต้นทุนดำเนินงาน), ADCxxx (ค่าบริหารจัดการ), BENxxx (ผลประโยชน์)
 async function generateCategoryId(prefix) {
   const [rows] = await db.query(
     'SELECT category_id FROM categories WHERE category_id LIKE ? ORDER BY LENGTH(category_id) DESC, category_id DESC LIMIT 1',
@@ -26,6 +27,7 @@ exports.getAll = async (req, res) => {
     const sql = `
       SELECT
         c.category_id, c.category_name, c.type_id, c.category_group,
+        c.unit_label, c.rate_label,
         et.type_name, et.is_inflow
       FROM categories c
       LEFT JOIN entry_types et ON c.type_id = et.type_id
@@ -57,7 +59,7 @@ exports.getEntryTypes = async (req, res) => {
 // ══════════════════════════════════════════════════════════
 exports.create = async (req, res) => {
   try {
-    const { category_name, type_id, category_group } = req.body;
+    const { category_name, type_id, category_group, unit_label, rate_label } = req.body;
 
     if (!category_name || !type_id || !category_group) {
       return res.status(400).json({ status: 'error', message: 'กรุณากรอกข้อมูลให้ครบ' });
@@ -71,16 +73,24 @@ exports.create = async (req, res) => {
     if (!entryType) {
       return res.status(400).json({ status: 'error', message: 'ประเภทรายรับ/รายจ่ายไม่ถูกต้อง' });
     }
-    const prefix = entryType.is_inflow ? 'REV' : 'CAT';
+
+    // FR03-4: หมวดที่คิดแบบ "ปริมาณ × อัตรา" ต้องมีชื่อหน่วยครบทั้งคู่ ไม่งั้นฟอร์มจะแสดงไม่ถูก
+    if ((unit_label && !rate_label) || (!unit_label && rate_label)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'หมวดหมู่แบบคำนวณจากปริมาณ ต้องระบุทั้งชื่อหน่วยปริมาณและชื่ออัตราต่อหน่วย'
+      });
+    }
 
     // แข่งกันสร้างพร้อมกันได้ยากมากสำหรับหน้า admin แต่กันไว้เผื่อชนกัน — ลองใหม่ได้ถึง 3 ครั้ง
     let lastError;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const category_id = await generateCategoryId(prefix);
+      const category_id = await generateCategoryId(category_group);
       try {
         await db.query(
-          'INSERT INTO categories (category_id, category_name, type_id, category_group) VALUES (?, ?, ?, ?)',
-          [category_id, category_name, type_id, category_group]
+          `INSERT INTO categories (category_id, category_name, type_id, category_group, unit_label, rate_label)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [category_id, category_name, type_id, category_group, unit_label || null, rate_label || null]
         );
         return res.status(201).json({ status: 'success', message: 'เพิ่มหมวดหมู่สำเร็จ', data: { category_id } });
       } catch (error) {
@@ -104,7 +114,7 @@ exports.create = async (req, res) => {
 exports.update = async (req, res) => {
   try {
     const { id } = req.params;
-    const { category_name, type_id, category_group } = req.body;
+    const { category_name, type_id, category_group, unit_label, rate_label } = req.body;
 
     if (category_group) {
       const validGroups = ['INV', 'OPC', 'ADC', 'BEN'];
@@ -118,13 +128,22 @@ exports.update = async (req, res) => {
       return res.status(404).json({ status: 'error', message: 'ไม่พบหมวดหมู่นี้' });
     }
 
+    if ((unit_label && !rate_label) || (!unit_label && rate_label)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'หมวดหมู่แบบคำนวณจากปริมาณ ต้องระบุทั้งชื่อหน่วยปริมาณและชื่ออัตราต่อหน่วย'
+      });
+    }
+
     await db.query(
       `UPDATE categories SET
         category_name = COALESCE(?, category_name),
         type_id = COALESCE(?, type_id),
-        category_group = COALESCE(?, category_group)
+        category_group = COALESCE(?, category_group),
+        unit_label = ?,
+        rate_label = ?
        WHERE category_id = ?`,
-      [category_name || null, type_id || null, category_group || null, id]
+      [category_name || null, type_id || null, category_group || null, unit_label || null, rate_label || null, id]
     );
 
     res.json({ status: 'success', message: 'แก้ไขหมวดหมู่สำเร็จ' });
