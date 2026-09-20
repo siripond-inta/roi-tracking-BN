@@ -53,15 +53,33 @@ async function seedProjectTypes() {
   ]);
 }
 
-// ใช้ category_id ชุดเดียวกับที่ frontend hardcode ไว้ในฟอร์ม (REV001/CAT001/CAT002 ใน
-// estimated-form2.html, actual-form2.html) — ถ้าเปลี่ยน id จะ insert ledger ไม่ได้ (FK ไม่พบ)
+// FR03-3: รหัสหมวดหมู่ใช้กลุ่มค่าใช้จ่ายเป็น prefix (INVxxx/OPCxxx/ADCxxx/BENxxx) ให้จำแนก
+// ได้จากตัวรหัสเอง — ตรงกับที่ category.controller.js สร้างรหัสใหม่อัตโนมัติ
+// FR03-4: BEN003-BEN006 คือประโยชน์ทางอ้อม 4 หมวดที่ตีมูลค่าจาก "ปริมาณที่ลดได้ × อัตราต่อหน่วย"
+// (unit_label/rate_label บอกฟอร์มว่าช่องสองช่องนั้นชื่ออะไร ไม่ต้อง hardcode ใน frontend)
 async function seedCategories() {
   await db.insert(categories).values([
-    { categoryId: 'REV001', categoryName: 'การสร้างรายรับ', typeId: 2, categoryGroup: 'BEN' },
-    { categoryId: 'REV002', categoryName: 'การประหยัดต้นทุน', typeId: 2, categoryGroup: 'BEN' },
-    { categoryId: 'CAT001', categoryName: 'ต้นทุนดำเนินการ', typeId: 1, categoryGroup: 'OPC' },
-    { categoryId: 'CAT002', categoryName: 'ต้นทุนพัฒนา', typeId: 1, categoryGroup: 'INV' },
-    { categoryId: 'CAT003', categoryName: 'ต้นทุนทั่วไป', typeId: 1, categoryGroup: 'ADC' },
+    { categoryId: 'BEN001', categoryName: 'การสร้างรายรับ', typeId: 2, categoryGroup: 'BEN' },
+    { categoryId: 'BEN002', categoryName: 'การประหยัดต้นทุน', typeId: 2, categoryGroup: 'BEN' },
+    {
+      categoryId: 'BEN003', categoryName: 'การลดเวลาทำงาน', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'ชั่วโมงที่ประหยัดได้ (ชม.)', rateLabel: 'อัตราค่าจ้าง (บาท/ชม.)',
+    },
+    {
+      categoryId: 'BEN004', categoryName: 'การลดค่าเอกสาร', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'จำนวนชุดที่ลดได้ (ชุด)', rateLabel: 'ต้นทุนต่อชุด (บาท/ชุด)',
+    },
+    {
+      categoryId: 'BEN005', categoryName: 'การลดค่าใช้จ่ายวิเคราะห์โครงการ', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'ชั่วโมงที่ลดได้ (ชม.)', rateLabel: 'อัตราตอบแทนผู้วิเคราะห์ (บาท/ชม.)',
+    },
+    {
+      categoryId: 'BEN006', categoryName: 'การลดความผิดพลาด', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'จำนวนครั้งที่ลดได้ (ครั้ง)', rateLabel: 'ต้นทุนการแก้ไขต่อครั้ง (บาท/ครั้ง)',
+    },
+    { categoryId: 'OPC001', categoryName: 'ต้นทุนดำเนินการ', typeId: 1, categoryGroup: 'OPC' },
+    { categoryId: 'INV001', categoryName: 'ต้นทุนพัฒนา', typeId: 1, categoryGroup: 'INV' },
+    { categoryId: 'ADC001', categoryName: 'ต้นทุนทั่วไป', typeId: 1, categoryGroup: 'ADC' },
   ]);
 }
 
@@ -89,6 +107,8 @@ async function seedUsers() {
     { email: 'somchai@example.com', fullName: 'Somchai Suksan', role: 'project_owner', lastLoginAt: yearsAgo(4) },
     { email: 'araya@example.com', fullName: 'Araya Chaiyaporn', role: 'project_owner', lastLoginAt: new Date() },
     { email: 'admin@example.com', fullName: 'Admin User', role: 'admin', lastLoginAt: new Date() },
+    // FR01-2: บัญชีตัวอย่างระดับ viewer — ดูโครงการสาธารณะได้ แต่สร้าง/แก้ไข/ลบไม่ได้
+    { email: 'viewer@example.com', fullName: 'Viewer Demo', role: 'viewer', lastLoginAt: new Date() },
   ];
 
   const created = [];
@@ -178,52 +198,80 @@ async function seedProjectAccess(createdProjects, createdUsers) {
   await db.insert(projectAccess).values(rows);
 }
 
+// วันที่ของงวดที่ n นับจากเดือนเริ่มโครงการ (ใช้ 2026-01 เป็นเดือนแรกให้ข้อมูลเดโมคงที่)
+function periodDate(periodIndex) {
+  const d = new Date(Date.UTC(2026, 0, 15));
+  d.setUTCMonth(d.getUTCMonth() + (periodIndex - 1));
+  return d.toISOString().split('T')[0];
+}
+
+// FR03-2/FR04-1: ข้อมูลกระจายรายเดือนจริง (ไม่ได้กองอยู่งวดเดียว) เพื่อให้คำนวณ NCF,
+// กระแสเงินสดสะสม และระยะเวลาคืนทุนได้อย่างมีความหมาย
+// ตัวเลขชุดนี้ตั้งใจให้: ประมาณการคืนทุนเดือนที่ 11 (ROI สูงกว่าเป้า 20% = คุ้มค่า) ส่วนผลจริง
+// เพิ่งบันทึกถึงเดือนที่ 6 และ ROI ยังต่ำกว่าเป้า (ไม่คุ้มค่า) — เห็นความต่างชัดในรายงาน
+function buildLedgerLines(hasActual) {
+  const lines = [];
+  const push = (phase, periodIndex, categoryId, typeId, value, extra = {}) =>
+    lines.push({ phase, periodIndex, categoryId, typeId, value, ...extra });
+
+  // ── ประมาณการ (ESTIMATED) ครบ 12 เดือน ──
+  push('ESTIMATED', 1, 'INV001', 1, 200000, { note: 'ค่าพัฒนาระบบ (ลงทุนครั้งเดียวต้นโครงการ)' });
+  for (let m = 1; m <= 12; m++) {
+    push('ESTIMATED', m, 'OPC001', 1, 12500, { note: `ค่าดำเนินการเดือนที่ ${m}` });
+  }
+  for (let m = 2; m <= 12; m++) {
+    push('ESTIMATED', m, 'BEN001', 2, 85000, { note: `รายรับที่คาดว่าจะได้เดือนที่ ${m}` });
+  }
+  // ประโยชน์ทางอ้อม: เก็บเป็น ปริมาณ × อัตรา (FR03-4)
+  push('ESTIMATED', 3, 'BEN003', 2, null, {
+    unitQty: 120, unitCost: 350, note: 'ลดเวลาทำงานของทีมปฏิบัติการ',
+  });
+  push('ESTIMATED', 6, 'BEN004', 2, null, {
+    unitQty: 500, unitCost: 25, note: 'ลดการพิมพ์เอกสารกระดาษ',
+  });
+
+  if (!hasActual) return lines;
+
+  // ── ผลจริง (ACTUAL) บันทึกถึงเดือนที่ 6 ──
+  push('ACTUAL', 1, 'INV001', 1, 215000, { note: 'ค่าพัฒนาระบบจริง (เกินงบเล็กน้อย)' });
+  for (let m = 1; m <= 6; m++) {
+    push('ACTUAL', m, 'OPC001', 1, 13000, { note: `ค่าดำเนินการจริงเดือนที่ ${m}` });
+  }
+  for (let m = 2; m <= 6; m++) {
+    push('ACTUAL', m, 'BEN001', 2, 52000, { note: `รายรับจริงเดือนที่ ${m}` });
+  }
+  push('ACTUAL', 3, 'BEN003', 2, null, {
+    unitQty: 100, unitCost: 350, note: 'ลดเวลาทำงานได้จริง (ต่ำกว่าที่ประมาณไว้)',
+  });
+  push('ACTUAL', 6, 'BEN006', 2, null, {
+    unitQty: 40, unitCost: 800, note: 'ลดข้อผิดพลาดจากการคีย์ข้อมูลซ้ำ',
+  });
+
+  return lines;
+}
+
 async function seedProjectLedger(createdProjects) {
   const rows = [];
 
   for (const project of createdProjects) {
     const hasActual = project.status === 'in_progress' || project.status === 'completed';
 
-    const estimated = [
-      { categoryId: 'REV001', typeId: 2, amount: '650000.00' },
-      { categoryId: 'CAT002', typeId: 1, amount: '200000.00' },
-      { categoryId: 'CAT001', typeId: 1, amount: '150000.00' },
-    ];
-    for (const line of estimated) {
+    for (const line of buildLedgerLines(hasActual)) {
+      const total = line.unitQty != null ? line.unitQty * line.unitCost : line.value;
       rows.push({
         projectId: project.projectId,
-        phase: 'ESTIMATED',
-        periodIndex: 1,
+        phase: line.phase,
+        periodIndex: line.periodIndex,
         typeId: line.typeId,
         categoryId: line.categoryId,
-        amountBase: line.amount,
-        totalValue: line.amount,
-        transactionDate: '2026-01-15',
-        note: 'ประมาณการเริ่มต้นของโครงการ',
+        unitQty: line.unitQty != null ? String(line.unitQty) : null,
+        unitCost: line.unitCost != null ? String(line.unitCost) : null,
+        amountBase: String(total),
+        totalValue: String(total),
+        transactionDate: periodDate(line.periodIndex),
+        note: line.note || '',
         createdBy: project.owner.userId,
       });
-    }
-
-    if (hasActual) {
-      const actual = [
-        { categoryId: 'REV001', typeId: 2, amount: '612000.00' },
-        { categoryId: 'CAT002', typeId: 1, amount: '215000.00' },
-        { categoryId: 'CAT003', typeId: 1, amount: '48000.00' },
-      ];
-      for (const line of actual) {
-        rows.push({
-          projectId: project.projectId,
-          phase: 'ACTUAL',
-          periodIndex: 1,
-          typeId: line.typeId,
-          categoryId: line.categoryId,
-          amountBase: line.amount,
-          totalValue: line.amount,
-          transactionDate: '2026-04-30',
-          note: 'ผลดำเนินงานจริงงวดที่ 1',
-          createdBy: project.owner.userId,
-        });
-      }
     }
   }
 
@@ -250,7 +298,9 @@ async function main() {
   const createdProjects = await seedProjects(projectOwners);
 
   console.log('Seeding project_access...');
-  await seedProjectAccess(createdProjects, projectOwners);
+  // โครงการสาธารณะต้องแชร์ให้บัญชี viewer ด้วย ไม่งั้นหน้า Community ของ viewer จะว่างเปล่า
+  const audience = createdUsers.filter((u) => u.role === 'project_owner' || u.role === 'viewer');
+  await seedProjectAccess(createdProjects, audience);
 
   console.log('Seeding project_ledger...');
   await seedProjectLedger(createdProjects);

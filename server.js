@@ -28,6 +28,7 @@ const projectRoutes = require('./routes/project.routes');
 const authRoutes = require('./routes/auth.routes');
 const adminRoutes = require('./routes/admin.routes');
 const categoryRoutes = require('./routes/category.routes');
+const projectTypeRoutes = require('./routes/project-type.routes');
 
 // บอกแอปว่า ถ้า URL ขึ้นต้นด้วย /api/projects ให้ไปดูไฟล์ projectRoutes
 app.use('/api/projects', projectRoutes);
@@ -37,6 +38,8 @@ app.use('/api/auth', authRoutes);
 app.use('/api/admin', adminRoutes);
 // หมวดหมู่รายรับ/รายจ่าย (อ่านได้ทุก user, แก้ไขได้แค่ admin)
 app.use('/api/categories', categoryRoutes);
+// ประเภทโครงการ (อ่านได้ทุก user, แก้ไขได้แค่ admin)
+app.use('/api/project-types', projectTypeRoutes);
 
 
 // ตั้งค่า Port และ Start Server

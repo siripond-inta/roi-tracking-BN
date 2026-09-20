@@ -40,4 +40,18 @@ const verifyAdmin = (req, res, next) => {
   });
 };
 
-module.exports = { verifyToken, verifyAdmin };
+// FR01-2: แยกสิทธิ์ 3 ระดับ — role 'viewer' ดูได้อย่างเดียว ห้ามสร้าง/แก้ไข/ลบโครงการหรือ ledger
+// (project_owner และ admin เท่านั้นที่เขียนได้) บังคับที่ฝั่ง server ไม่พึ่งการซ่อนปุ่มใน frontend
+const verifyProjectWriter = (req, res, next) => {
+  verifyToken(req, res, () => {
+    if (req.user?.role === 'project_owner' || req.user?.role === 'admin') {
+      next();
+    } else {
+      res.status(403).json({
+        message: 'Access denied: บัญชีระดับ Viewer ดูข้อมูลได้อย่างเดียว ไม่สามารถแก้ไขโครงการได้'
+      });
+    }
+  });
+};
+
+module.exports = { verifyToken, verifyAdmin, verifyProjectWriter };
