@@ -7,6 +7,10 @@ stack (MySQL + migrations + API) can be run with Docker Compose.
 roi-tracking-BN/
 ├── config/db.config.js   Raw mysql2 pool used by the current controllers
 ├── controllers/ routes/ middleware/   Express app code
+├── services/
+│   ├── finance.js        All ROI / cash-flow / payback logic (pure functions, no DB access)
+│   └── ledger-input.js   Validates ledger input and expands month ranges into monthly rows
+├── tests/                Unit tests for services/ (`npm test`)
 ├── db/
 │   ├── schema.js         Drizzle table definitions — source of truth for the DB schema
 │   ├── index.js          Drizzle client instance (mysql2 pool + drizzle()), for new/refactored code
@@ -27,12 +31,70 @@ The schema implements the `roi_tracking_db` DBML spec (v1.2 — Gap Analysis Upd
 `project_types`, `entry_types`, `categories`, `projects`, `project_access`, `project_ledger`,
 `system_settings`.
 
-> **Heads-up:** this schema matches the new DBML spec, which is *not* identical to what the
-> current controllers/frontend actually query today (e.g. `users.company_name`,
-> `projects.is_public` / `custom_project_type`, and lowercase `'Estimated'/'Actual'` phase values
-> used in `controllers/project.controller.js` aren't part of the new schema; the new schema also
-> adds required fields like `project_ledger.period_index`). Drizzle + Docker setup was done first
-> by request — updating the application code to match this schema is a follow-up task.
+Notable columns:
+
+- `categories.category_group` — `REV` (direct revenue), `BEN` (indirect benefit), `INV` / `OPC` /
+  `ADC` (investment / operating / additional cost). The group decides the category code prefix
+  (`REV001`, `BEN002`, …), whether it is an inflow or outflow, and how it is counted (see below).
+  `BEN` categories must have `unit_label` + `rate_label` (e.g. "hours saved per month" ×
+  "hourly wage").
+- `project_types.calculation_method` — `REVENUE`, `COST_SAVING` or `MIXED`.
+- `projects.status` — `planning`, `in_progress`, `completed` (and `archived`).
+- `project_ledger` — one row per project, phase (`ESTIMATED` / `ACTUAL`) and month
+  (`period_index`); indirect benefits also store `unit_qty` × `unit_cost`.
+
+## How ROI is calculated
+
+All calculations live in [`services/finance.js`](services/finance.js) and every endpoint that
+returns figures (project list, report analytics, form preview) goes through it, so the numbers
+match on every page.
+
+| Source | Category group | Entered as | Counted when project type is |
+|---|---|---|---|
+| Direct revenue | `REV` | amount (THB) per month | `REVENUE`, `MIXED` |
+| Indirect benefit | `BEN` | quantity per month × rate per unit | `COST_SAVING`, `MIXED` |
+| Cost | `INV` / `OPC` / `ADC` | amount (THB) per month | always |
+
+- **ROI (%)** = (counted benefit − cost) ÷ cost × 100
+- **Payback month** = first month where the cumulative net cash flow is back to ≥ 0 (after some
+  cost has been incurred)
+- **Indirect benefit, annualized** = average monthly indirect benefit × 12
+- **Worthwhile** = ROI ≥ the project's `target_roi_percent` (actual ROI once actual data exists,
+  otherwise estimated)
+- Benefits that were entered but aren't counted for the project's type are reported separately as
+  `excludedBenefit` instead of being silently dropped.
+
+Project status is kept in sync automatically: saving the first actual data moves a project from
+`planning` to `in_progress`, removing all actual data moves it back, `completed` requires actual
+data, and `completed` / `archived` projects reject ledger changes.
+
+## Entering ledger data
+
+`PUT /api/projects/:id/ledgers/estimated` and `.../actual` replace all rows of that phase (in a
+transaction — nothing is lost if validation fails). Each item covers a range of months; the API
+expands it into one row per month and derives the entry type and transaction date from the
+category and project start date:
+
+```json
+{ "ledgers": [
+  { "category_id": "INV001", "total_value": 150000, "period_from": 1, "period_to": 1 },
+  { "category_id": "BEN001", "unit_qty": 80, "unit_cost": 250, "period_from": 2, "period_to": 12, "note": "Less manual reporting" },
+  { "category_id": "REV001", "total_value": 20000, "period_from": 3, "period_to": 12 }
+] }
+```
+
+Negative numbers, month ranges outside the project duration, and indirect benefits with only a
+quantity or only a rate are rejected with a 400 and a Thai error message.
+
+`POST /api/projects/:id/analytics/preview` takes the same `{ phase, ledgers }` body and returns the
+analytics as if those rows were saved (nothing is written). The report forms use it to show live
+ROI / payback while the user is typing.
+
+## Tests
+
+```bash
+npm test   # node --test — unit tests for services/finance.js and services/ledger-input.js
+```
 
 ### Common commands
 
@@ -50,10 +112,16 @@ optional `DB_PORT`) via `drizzle.config.js`.
 ## Seeding mock data
 
 [`db/seed.js`](db/seed.js) **deletes all rows** in every table and inserts a consistent mock
-dataset: 3 users (`project_owner` role), 3 projects each (9 total), a mix of `public` projects
-(shared as read-only to the other two users via `project_access`, `permission_level: 'viewer'`)
-and `private` projects (no access rows for anyone but the owner), plus estimated/actual
-`project_ledger` entries, categories, entry types, project types, and system settings.
+dataset:
+
+- 5 users: `nichakan@`, `somchai@` (not logged in for 4 years — shows up as dormant in the admin
+  page) and `araya@example.com` (`project_owner`), `admin@example.com` (`admin`),
+  `viewer@example.com` (`viewer`, read-only)
+- the 3 project types (`REVENUE` / `COST_SAVING` / `MIXED`) and the categories for direct revenue,
+  the 4 indirect benefits (staff time, documents, project analysis, error costs) and costs
+- 9 projects — one of every project type × status combination — with estimated data, and actual
+  data for the `in_progress` (6 months) and `completed` (12 months) ones. Projects with actual
+  data are public (shared read-only via `project_access`).
 
 All seeded users share the same demo password: **`Passw0rd!`** (e.g. `nichakan@example.com` /
 `Passw0rd!`).
