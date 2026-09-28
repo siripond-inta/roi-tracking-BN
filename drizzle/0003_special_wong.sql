@@ -1,0 +1,1 @@
+ALTER TABLE `categories` MODIFY COLUMN `category_group` enum('INV','OPC','ADC','REV','BEN') NOT NULL;
