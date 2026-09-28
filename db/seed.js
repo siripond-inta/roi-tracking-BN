@@ -1,13 +1,14 @@
 // db/seed.js
-// Resets and fills every table with mock data for local/dev use.
+// ล้างแล้วเติมข้อมูลตัวอย่างทุกตาราง สำหรับ dev/เดโม
 //
-// WARNING: this DELETES all existing rows in these tables before inserting fresh mock data.
-// Safe to re-run any time you want a clean, predictable dataset — but don't run it against a
-// database that has real data you want to keep.
+// คำเตือน: สคริปต์นี้ลบข้อมูลเดิมทั้งหมดก่อน — อย่ารันกับฐานข้อมูลที่มีข้อมูลจริงที่ต้องเก็บไว้
 //
 // Usage:
-//   npm run db:seed                          (local, uses .env)
-//   docker compose run --rm seed             (against the dockerized mysql)
+//   npm run db:seed                          (local, ใช้ .env)
+//   docker compose run --rm seed             (กับ mysql ใน docker)
+//
+// ข้อมูลตัวอย่างออกแบบให้เดโมได้ครบทุกกรณี: 3 ประเภทโครงการ (มุ่งรายได้ / มุ่งลดต้นทุน / ผสม)
+// × 3 สถานะ (วางแผน / กำลังดำเนินการ / สิ้นสุดแล้ว) และมีทั้งโครงการที่คุ้มค่าและไม่คุ้มค่า
 
 const bcrypt = require('bcryptjs');
 const { db, pool } = require('./index');
@@ -21,6 +22,7 @@ const {
   projectLedger,
   systemSettings,
 } = require('./schema');
+const { periodDate } = require('../services/ledger-input');
 
 const DEMO_PASSWORD = 'Passw0rd!';
 
@@ -35,79 +37,96 @@ async function resetTables() {
   await db.delete(systemSettings);
 }
 
-// หมายเหตุ: 1 = รายจ่าย, 2 = รายรับ — ต้องตรงกับที่ frontend hardcode ไว้ (เช่น
-// estimated-form2.ts, actual-form2.ts: "type_id: 1 = Expense, 2 = Revenue") ห้ามสลับ
+// 1 = รายจ่าย, 2 = รายรับ
 async function seedEntryTypes() {
   await db.insert(entryTypes).values([
-    { typeId: 1, typeName: 'รายจ่าย', isInflow: false, description: 'รายการที่เป็นต้นทุน/ค่าใช้จ่ายของโครงการ' },
-    { typeId: 2, typeName: 'รายรับ', isInflow: true, description: 'รายการที่เป็นรายรับ/ผลประโยชน์ของโครงการ' },
+    { typeId: 1, typeName: 'รายจ่าย', isInflow: false, description: 'ต้นทุน/ค่าใช้จ่ายของโครงการ' },
+    { typeId: 2, typeName: 'รายรับ', isInflow: true, description: 'รายได้หรือผลประโยชน์ของโครงการ' },
   ]);
 }
+
+// ประเภทโครงการกำหนดตรรกะการคำนวณ (services/finance.js):
+//   REVENUE นับรายได้โดยตรง · COST_SAVING นับประโยชน์ทางอ้อม · MIXED นับทั้งสองอย่าง
+const TYPE = { REVENUE: 1, COST_SAVING: 2, MIXED: 3 };
 
 async function seedProjectTypes() {
   await db.insert(projectTypes).values([
-    { typeId: 1, typeName: 'โครงการเพิ่มรายได้', description: 'โครงการที่มุ่งสร้างหรือเพิ่มรายได้', calculationMethod: 'REVENUE' },
-    { typeId: 2, typeName: 'โครงการลดต้นทุน', description: 'โครงการที่มุ่งลดค่าใช้จ่ายหรือเพิ่มประสิทธิภาพ', calculationMethod: 'COST_SAVING' },
-    { typeId: 3, typeName: 'โครงการผสม', description: 'โครงการที่ทั้งเพิ่มรายได้และลดต้นทุน', calculationMethod: 'MIXED' },
-    { typeId: 4, typeName: 'อื่นๆ', description: 'โครงการประเภทอื่นๆ ที่ระบุเพิ่มเติม', calculationMethod: null },
+    {
+      typeId: TYPE.REVENUE,
+      typeName: 'โครงการมุ่งสร้างรายได้',
+      description: 'คิดผลตอบแทนจากรายได้โดยตรง เช่น ยอดขายหรือค่าบริการที่เพิ่มขึ้น',
+      calculationMethod: 'REVENUE',
+    },
+    {
+      typeId: TYPE.COST_SAVING,
+      typeName: 'โครงการมุ่งลดต้นทุน',
+      description: 'คิดผลตอบแทนจากประโยชน์ทางอ้อม เช่น เวลาทำงานหรือค่าเอกสารที่ลดลง',
+      calculationMethod: 'COST_SAVING',
+    },
+    {
+      typeId: TYPE.MIXED,
+      typeName: 'โครงการแบบผสมผสาน',
+      description: 'คิดผลตอบแทนทั้งจากรายได้โดยตรงและประโยชน์ทางอ้อม',
+      calculationMethod: 'MIXED',
+    },
   ]);
 }
 
-// FR03-3: รหัสหมวดหมู่ใช้กลุ่มค่าใช้จ่ายเป็น prefix (INVxxx/OPCxxx/ADCxxx/BENxxx) ให้จำแนก
-// ได้จากตัวรหัสเอง — ตรงกับที่ category.controller.js สร้างรหัสใหม่อัตโนมัติ
-// FR03-4: BEN003-BEN006 คือประโยชน์ทางอ้อม 4 หมวดที่ตีมูลค่าจาก "ปริมาณที่ลดได้ × อัตราต่อหน่วย"
-// (unit_label/rate_label บอกฟอร์มว่าช่องสองช่องนั้นชื่ออะไร ไม่ต้อง hardcode ใน frontend)
+// รหัสหมวดหมู่ใช้กลุ่มเป็น prefix (ตรงกับที่ category.controller.js สร้างรหัสใหม่ให้อัตโนมัติ)
+// BEN001–BEN004 คือประโยชน์ทางอ้อม 4 หมวดหลักตาม Proposal ข้อ 6.5 / 7.1 — ตีมูลค่าจาก
+// "ปริมาณที่ลดได้ต่อเดือน × อัตราต่อหน่วย" โดยแต่ละองค์กรใส่อัตราของตัวเองได้
 async function seedCategories() {
   await db.insert(categories).values([
-    { categoryId: 'BEN001', categoryName: 'การสร้างรายรับ', typeId: 2, categoryGroup: 'BEN' },
-    { categoryId: 'BEN002', categoryName: 'การประหยัดต้นทุน', typeId: 2, categoryGroup: 'BEN' },
+    { categoryId: 'REV001', categoryName: 'รายได้จากการขายสินค้า/บริการ', typeId: 2, categoryGroup: 'REV' },
+    { categoryId: 'REV002', categoryName: 'รายได้ค่าสมาชิก/ค่าบริการรายเดือน', typeId: 2, categoryGroup: 'REV' },
     {
-      categoryId: 'BEN003', categoryName: 'การลดเวลาทำงาน', typeId: 2, categoryGroup: 'BEN',
-      unitLabel: 'ชั่วโมงที่ประหยัดได้ (ชม.)', rateLabel: 'อัตราค่าจ้าง (บาท/ชม.)',
+      categoryId: 'BEN001', categoryName: 'การลดเวลาทำงานของบุคลากร', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'ชั่วโมงที่ลดได้ต่อเดือน (ชม.)', rateLabel: 'อัตราค่าจ้างต่อชั่วโมง (บาท)',
     },
     {
-      categoryId: 'BEN004', categoryName: 'การลดค่าเอกสาร', typeId: 2, categoryGroup: 'BEN',
-      unitLabel: 'จำนวนชุดที่ลดได้ (ชุด)', rateLabel: 'ต้นทุนต่อชุด (บาท/ชุด)',
+      categoryId: 'BEN002', categoryName: 'การลดค่าใช้จ่ายด้านเอกสาร', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'จำนวนชุด/แผ่นที่ลดได้ต่อเดือน', rateLabel: 'ต้นทุนเฉลี่ยต่อหน่วย (บาท)',
     },
     {
-      categoryId: 'BEN005', categoryName: 'การลดค่าใช้จ่ายวิเคราะห์โครงการ', typeId: 2, categoryGroup: 'BEN',
-      unitLabel: 'ชั่วโมงที่ลดได้ (ชม.)', rateLabel: 'อัตราตอบแทนผู้วิเคราะห์ (บาท/ชม.)',
+      categoryId: 'BEN003', categoryName: 'การลดค่าใช้จ่ายในการวิเคราะห์โครงการ', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'ชั่วโมงวิเคราะห์ที่ลดได้ต่อเดือน (ชม.)', rateLabel: 'อัตราค่าตอบแทนต่อชั่วโมง (บาท)',
     },
     {
-      categoryId: 'BEN006', categoryName: 'การลดความผิดพลาด', typeId: 2, categoryGroup: 'BEN',
-      unitLabel: 'จำนวนครั้งที่ลดได้ (ครั้ง)', rateLabel: 'ต้นทุนการแก้ไขต่อครั้ง (บาท/ครั้ง)',
+      categoryId: 'BEN004', categoryName: 'การลดต้นทุนจากความผิดพลาด', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'จำนวนครั้งที่ลดความผิดพลาดได้ต่อเดือน', rateLabel: 'ต้นทุนการแก้ไขต่อครั้ง (บาท)',
     },
-    { categoryId: 'OPC001', categoryName: 'ต้นทุนดำเนินการ', typeId: 1, categoryGroup: 'OPC' },
-    { categoryId: 'INV001', categoryName: 'ต้นทุนพัฒนา', typeId: 1, categoryGroup: 'INV' },
-    { categoryId: 'ADC001', categoryName: 'ต้นทุนทั่วไป', typeId: 1, categoryGroup: 'ADC' },
+    { categoryId: 'INV001', categoryName: 'ค่าพัฒนาระบบ/ซอฟต์แวร์', typeId: 1, categoryGroup: 'INV' },
+    { categoryId: 'INV002', categoryName: 'ค่าฮาร์ดแวร์และอุปกรณ์', typeId: 1, categoryGroup: 'INV' },
+    { categoryId: 'OPC001', categoryName: 'ค่าบำรุงรักษาระบบ', typeId: 1, categoryGroup: 'OPC' },
+    { categoryId: 'OPC002', categoryName: 'ค่าบุคลากรดำเนินงาน', typeId: 1, categoryGroup: 'OPC' },
+    { categoryId: 'ADC001', categoryName: 'ค่าบริหารจัดการโครงการ', typeId: 1, categoryGroup: 'ADC' },
+    { categoryId: 'ADC002', categoryName: 'ค่าฝึกอบรมผู้ใช้งาน', typeId: 1, categoryGroup: 'ADC' },
   ]);
 }
 
 async function seedSystemSettings() {
   await db.insert(systemSettings).values([
-    { settingKey: 'default_discount_rate', settingValue: '10', description: 'อัตราคิดลดเริ่มต้นสำหรับคำนวณ NPV (%)' },
     { settingKey: 'default_currency', settingValue: 'THB', description: 'สกุลเงินเริ่มต้นของระบบ' },
     { settingKey: 'fiscal_year_start_month', settingValue: '1', description: 'เดือนเริ่มต้นปีงบประมาณ (1-12)' },
-    { settingKey: 'app_version', settingValue: '1.2.0', description: 'เวอร์ชันสคีมาปัจจุบัน (อ้างอิง DBML v1.2)' },
+    { settingKey: 'app_version', settingValue: '1.3.0', description: 'เวอร์ชันสคีมาปัจจุบัน' },
   ]);
 }
 
-function yearsAgo(n) {
+function monthsAgo(n) {
   const d = new Date();
-  d.setFullYear(d.getFullYear() - n);
+  d.setMonth(d.getMonth() - n);
   return d;
 }
 
 async function seedUsers() {
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
   const demoUsers = [
-    // Somchai's last login is 4 years ago on purpose, to demo the admin "soft delete
-    // accounts inactive > 3 years" feature against a real dormant candidate.
     { email: 'nichakan@example.com', fullName: 'Nichakan Boonmee', role: 'project_owner', lastLoginAt: new Date() },
-    { email: 'somchai@example.com', fullName: 'Somchai Suksan', role: 'project_owner', lastLoginAt: yearsAgo(4) },
+    // login ล่าสุด 4 ปีก่อน — ใช้เดโมฟีเจอร์ admin ปิดบัญชีที่ไม่ใช้งานเกิน 3 ปี
+    { email: 'somchai@example.com', fullName: 'Somchai Suksan', role: 'project_owner', lastLoginAt: monthsAgo(48) },
     { email: 'araya@example.com', fullName: 'Araya Chaiyaporn', role: 'project_owner', lastLoginAt: new Date() },
     { email: 'admin@example.com', fullName: 'Admin User', role: 'admin', lastLoginAt: new Date() },
-    // FR01-2: บัญชีตัวอย่างระดับ viewer — ดูโครงการสาธารณะได้ แต่สร้าง/แก้ไข/ลบไม่ได้
+    // บัญชีระดับ viewer — ดูโครงการสาธารณะได้ แต่สร้าง/แก้ไข/ลบไม่ได้
     { email: 'viewer@example.com', fullName: 'Viewer Demo', role: 'viewer', lastLoginAt: new Date() },
   ];
 
@@ -126,163 +145,181 @@ async function seedUsers() {
   return created;
 }
 
-// 3 projects per user: [public+completed, public+in_progress, private+planning]
-// กติกา: โปรเจกต์ status 'planning' ยังไม่มีข้อมูล Actual (status='Estimated') จึงเปิดสาธารณะไม่ได้
-// เลยตั้งเป็น private เท่านั้น — public มีได้แค่ completed/in_progress ที่มี Actual แล้ว
+// ── แผนงาน (ESTIMATED) ของโครงการแต่ละประเภท — ระยะเวลา 12 เดือน ─────────────
+// แต่ละรายการ: { cat, from, to, amount } หรือ { cat, from, to, qty, rate } สำหรับประโยชน์ทางอ้อม
+const PLANS = {
+  [TYPE.REVENUE]: {
+    budget: 450000,
+    target: 40,
+    items: [
+      { cat: 'INV001', from: 1, to: 1, amount: 280000, note: 'พัฒนาระบบหน้าร้านออนไลน์' },
+      { cat: 'INV002', from: 1, to: 1, amount: 120000, note: 'เซิร์ฟเวอร์และอุปกรณ์' },
+      { cat: 'OPC001', from: 1, to: 12, amount: 12000, note: 'ค่าบำรุงรักษารายเดือน' },
+      { cat: 'OPC002', from: 1, to: 12, amount: 25000, note: 'เจ้าหน้าที่ดูแลระบบ' },
+      { cat: 'ADC001', from: 1, to: 12, amount: 6000, note: 'ค่าบริหารโครงการ' },
+      { cat: 'REV001', from: 2, to: 12, amount: 115000, note: 'ยอดขายออนไลน์ที่เพิ่มขึ้น' },
+      { cat: 'REV002', from: 4, to: 12, amount: 18000, note: 'ค่าสมาชิกรายเดือน' },
+    ],
+  },
+  [TYPE.COST_SAVING]: {
+    budget: 300000,
+    target: 60,
+    items: [
+      { cat: 'INV001', from: 1, to: 1, amount: 200000, note: 'พัฒนาระบบอัตโนมัติ' },
+      { cat: 'INV002', from: 1, to: 1, amount: 45000, note: 'เครื่องสแกนและอุปกรณ์' },
+      { cat: 'ADC002', from: 1, to: 1, amount: 20000, note: 'อบรมพนักงาน' },
+      { cat: 'OPC001', from: 1, to: 12, amount: 9000, note: 'ค่าบำรุงรักษารายเดือน' },
+      { cat: 'BEN001', from: 2, to: 12, qty: 100, rate: 320, note: 'ลดงานคีย์ข้อมูลซ้ำซ้อน' },
+      { cat: 'BEN002', from: 2, to: 12, qty: 900, rate: 15, note: 'เลิกพิมพ์ใบงานกระดาษ' },
+      { cat: 'BEN003', from: 3, to: 12, qty: 20, rate: 650, note: 'รายงานสรุปอัตโนมัติ' },
+      { cat: 'BEN004', from: 3, to: 12, qty: 8, rate: 2000, note: 'ลดการส่งสินค้าผิด' },
+    ],
+  },
+  [TYPE.MIXED]: {
+    budget: 380000,
+    target: 30,
+    items: [
+      { cat: 'INV001', from: 1, to: 1, amount: 250000, note: 'พัฒนาแพลตฟอร์ม' },
+      { cat: 'INV002', from: 1, to: 1, amount: 60000, note: 'อุปกรณ์และลิขสิทธิ์' },
+      { cat: 'ADC002', from: 1, to: 1, amount: 15000, note: 'อบรมผู้ใช้งาน' },
+      { cat: 'OPC001', from: 1, to: 12, amount: 10000, note: 'ค่าบำรุงรักษารายเดือน' },
+      { cat: 'OPC002', from: 1, to: 12, amount: 18000, note: 'ทีมดูแลลูกค้า' },
+      { cat: 'REV001', from: 2, to: 12, amount: 60000, note: 'รายได้จากช่องทางใหม่' },
+      { cat: 'REV002', from: 3, to: 12, amount: 12000, note: 'ค่าบริการรายเดือน' },
+      { cat: 'BEN001', from: 2, to: 12, qty: 60, rate: 300, note: 'ลดเวลาตอบคำถามลูกค้า' },
+      { cat: 'BEN004', from: 3, to: 12, qty: 6, rate: 1800, note: 'ลดการสั่งซื้อผิดพลาด' },
+    ],
+  },
+};
+
+// สามโครงการต่อเจ้าของ — จัดให้ทุกประเภทเจอครบทุกสถานะ
+// actualFactor = ผลจริงเทียบกับแผน (ใช้สร้างทั้งโครงการที่คุ้มค่าและไม่คุ้มค่า)
 const PROJECT_TEMPLATES = [
   [
-    { name: 'ระบบขายสินค้าออนไลน์', typeId: 1, status: 'completed', isPublic: true },
-    { name: 'โครงการลดต้นทุนคลังสินค้า', typeId: 2, status: 'in_progress', isPublic: true },
-    { name: 'ระบบ CRM บริหารลูกค้าสัมพันธ์', typeId: 3, status: 'planning', isPublic: false },
+    { name: 'ระบบขายสินค้าออนไลน์', typeId: TYPE.REVENUE, status: 'completed', actualFactor: 1.05 },
+    { name: 'ระบบจัดการคลังสินค้าอัตโนมัติ', typeId: TYPE.COST_SAVING, status: 'in_progress', actualFactor: 0.9 },
+    { name: 'ระบบ CRM บริหารลูกค้าสัมพันธ์', typeId: TYPE.MIXED, status: 'planning' },
   ],
   [
-    { name: 'แอปพลิเคชันสั่งอาหารเดลิเวอรี่', typeId: 1, status: 'completed', isPublic: true },
-    { name: 'โครงการลดต้นทุนพลังงานโรงงาน', typeId: 2, status: 'in_progress', isPublic: true },
-    { name: 'ระบบบริหารจัดการพนักงาน (HRIS)', typeId: 3, status: 'planning', isPublic: false },
+    { name: 'ระบบเอกสารอิเล็กทรอนิกส์ (e-Document)', typeId: TYPE.COST_SAVING, status: 'completed', actualFactor: 0.55 },
+    { name: 'แอปพลิเคชันสั่งอาหารเดลิเวอรี่', typeId: TYPE.MIXED, status: 'in_progress', actualFactor: 1.1 },
+    { name: 'แพลตฟอร์มจองคิวออนไลน์', typeId: TYPE.REVENUE, status: 'planning' },
   ],
   [
-    { name: 'แพลตฟอร์มขายคอร์สออนไลน์', typeId: 1, status: 'completed', isPublic: true },
-    { name: 'โครงการลดของเสียในสายการผลิต', typeId: 2, status: 'in_progress', isPublic: true },
-    { name: 'ระบบวิเคราะห์ข้อมูลลูกค้า (Data Analytics)', typeId: 3, status: 'planning', isPublic: false },
+    { name: 'แพลตฟอร์มขายคอร์สออนไลน์', typeId: TYPE.MIXED, status: 'completed', actualFactor: 0.95 },
+    { name: 'ระบบสมาชิกและแต้มสะสม', typeId: TYPE.REVENUE, status: 'in_progress', actualFactor: 0.85 },
+    { name: 'ระบบวิเคราะห์ข้อมูลลูกค้า (Data Analytics)', typeId: TYPE.COST_SAVING, status: 'planning' },
   ],
 ];
 
-async function seedProjects(createdUsers) {
-  const createdProjects = [];
+const ACTUAL_MONTHS = { completed: 12, in_progress: 6, planning: 0 };
+// โครงการที่ปิดแล้วเริ่มเมื่อ 14 เดือนก่อน กำลังดำเนินการเริ่ม 7 เดือนก่อน ส่วนวางแผนเริ่มเดือนนี้
+const STARTED_MONTHS_AGO = { completed: 14, in_progress: 7, planning: 0 };
 
-  for (let u = 0; u < createdUsers.length; u++) {
-    const owner = createdUsers[u];
+async function seedProjects(owners) {
+  const createdProjects = [];
+  for (let u = 0; u < owners.length; u++) {
+    const owner = owners[u];
     for (const tpl of PROJECT_TEMPLATES[u]) {
+      const plan = PLANS[tpl.typeId];
+      const createdAt = monthsAgo(STARTED_MONTHS_AGO[tpl.status]);
       const [result] = await db.insert(projects).values({
         userId: owner.userId,
         projectName: tpl.name,
         projectTypeId: tpl.typeId,
         durationMonths: 12,
-        initialBudget: '500000.00',
-        targetRoiPercent: '20.00',
-        discountRate: '10.00',
+        initialBudget: String(plan.budget),
+        targetRoiPercent: String(plan.target),
         status: tpl.status,
+        createdAt,
       });
-      createdProjects.push({ projectId: result.insertId, owner, ...tpl });
+      createdProjects.push({ projectId: result.insertId, owner, createdAt, ...tpl });
     }
   }
   return createdProjects;
 }
 
-async function seedProjectAccess(createdProjects, createdUsers) {
+async function seedProjectAccess(createdProjects, audience) {
   const rows = [];
-
   for (const project of createdProjects) {
-    // The owner always has an explicit 'owner' entry in the access list.
-    rows.push({
-      projectId: project.projectId,
-      userId: project.owner.userId,
-      permissionLevel: 'owner',
-      sharedBy: null,
-    });
-
-    // Public projects are shared as read-only to every other user; private projects are not shared.
-    if (project.isPublic) {
-      for (const other of createdUsers) {
-        if (other.userId === project.owner.userId) continue;
-        rows.push({
-          projectId: project.projectId,
-          userId: other.userId,
-          permissionLevel: 'viewer',
-          sharedBy: project.owner.userId,
-        });
-      }
+    rows.push({ projectId: project.projectId, userId: project.owner.userId, permissionLevel: 'owner', sharedBy: null });
+    // โครงการที่มีผลจริงแล้วเปิดสาธารณะ (แชร์ viewer ให้ทุกคน) ส่วนที่ยังวางแผนอยู่เป็นส่วนตัว
+    if (ACTUAL_MONTHS[project.status] === 0) continue;
+    for (const other of audience) {
+      if (other.userId === project.owner.userId) continue;
+      rows.push({ projectId: project.projectId, userId: other.userId, permissionLevel: 'viewer', sharedBy: project.owner.userId });
     }
   }
-
   await db.insert(projectAccess).values(rows);
 }
 
-// วันที่ของงวดที่ n นับจากเดือนเริ่มโครงการ (ใช้ 2026-01 เป็นเดือนแรกให้ข้อมูลเดโมคงที่)
-function periodDate(periodIndex) {
-  const d = new Date(Date.UTC(2026, 0, 15));
-  d.setUTCMonth(d.getUTCMonth() + (periodIndex - 1));
-  return d.toISOString().split('T')[0];
+// ความผันผวนรายเดือนแบบคงที่ (ไม่สุ่ม) ให้กราฟดูสมจริงแต่ seed ซ้ำได้ผลเท่าเดิมทุกครั้ง
+const wiggle = (period, salt) => 0.92 + (((period * 7 + salt * 3) % 5) * 0.04);
+
+function ledgerRow(project, phase, period, catId, value, extra = {}) {
+  const isInflow = catId.startsWith('REV') || catId.startsWith('BEN');
+  return {
+    projectId: project.projectId,
+    phase,
+    periodIndex: period,
+    typeId: isInflow ? 2 : 1,
+    categoryId: catId,
+    unitQty: extra.qty != null ? String(extra.qty) : null,
+    unitCost: extra.rate != null ? String(extra.rate) : null,
+    amountBase: String(value),
+    totalValue: String(value),
+    transactionDate: periodDate(project.createdAt, period),
+    note: extra.note || '',
+    createdBy: project.owner.userId,
+  };
 }
 
-// FR03-2/FR04-1: ข้อมูลกระจายรายเดือนจริง (ไม่ได้กองอยู่งวดเดียว) เพื่อให้คำนวณ NCF,
-// กระแสเงินสดสะสม และระยะเวลาคืนทุนได้อย่างมีความหมาย
-// ตัวเลขชุดนี้ตั้งใจให้: ประมาณการคืนทุนเดือนที่ 11 (ROI สูงกว่าเป้า 20% = คุ้มค่า) ส่วนผลจริง
-// เพิ่งบันทึกถึงเดือนที่ 6 และ ROI ยังต่ำกว่าเป้า (ไม่คุ้มค่า) — เห็นความต่างชัดในรายงาน
-function buildLedgerLines(hasActual) {
-  const lines = [];
-  const push = (phase, periodIndex, categoryId, typeId, value, extra = {}) =>
-    lines.push({ phase, periodIndex, categoryId, typeId, value, ...extra });
+function buildLedger(project, salt) {
+  const plan = PLANS[project.typeId];
+  const rows = [];
+  const actualMonths = ACTUAL_MONTHS[project.status];
 
-  // ── ประมาณการ (ESTIMATED) ครบ 12 เดือน ──
-  push('ESTIMATED', 1, 'INV001', 1, 200000, { note: 'ค่าพัฒนาระบบ (ลงทุนครั้งเดียวต้นโครงการ)' });
-  for (let m = 1; m <= 12; m++) {
-    push('ESTIMATED', m, 'OPC001', 1, 12500, { note: `ค่าดำเนินการเดือนที่ ${m}` });
-  }
-  for (let m = 2; m <= 12; m++) {
-    push('ESTIMATED', m, 'BEN001', 2, 85000, { note: `รายรับที่คาดว่าจะได้เดือนที่ ${m}` });
-  }
-  // ประโยชน์ทางอ้อม: เก็บเป็น ปริมาณ × อัตรา (FR03-4)
-  push('ESTIMATED', 3, 'BEN003', 2, null, {
-    unitQty: 120, unitCost: 350, note: 'ลดเวลาทำงานของทีมปฏิบัติการ',
-  });
-  push('ESTIMATED', 6, 'BEN004', 2, null, {
-    unitQty: 500, unitCost: 25, note: 'ลดการพิมพ์เอกสารกระดาษ',
-  });
+  for (const item of plan.items) {
+    for (let period = item.from; period <= item.to; period++) {
+      // แผน: ค่าเท่ากันทุกเดือนในช่วง
+      if (item.qty != null) {
+        rows.push(ledgerRow(project, 'ESTIMATED', period, item.cat, item.qty * item.rate,
+          { qty: item.qty, rate: item.rate, note: item.note }));
+      } else {
+        rows.push(ledgerRow(project, 'ESTIMATED', period, item.cat, item.amount, { note: item.note }));
+      }
 
-  if (!hasActual) return lines;
-
-  // ── ผลจริง (ACTUAL) บันทึกถึงเดือนที่ 6 ──
-  push('ACTUAL', 1, 'INV001', 1, 215000, { note: 'ค่าพัฒนาระบบจริง (เกินงบเล็กน้อย)' });
-  for (let m = 1; m <= 6; m++) {
-    push('ACTUAL', m, 'OPC001', 1, 13000, { note: `ค่าดำเนินการจริงเดือนที่ ${m}` });
+      // ผลจริง: เฉพาะเดือนที่ผ่านมาแล้ว — ผลประโยชน์ปรับตาม actualFactor, ต้นทุนเกินแผนเล็กน้อย
+      if (period > actualMonths) continue;
+      const isBenefit = item.cat.startsWith('REV') || item.cat.startsWith('BEN');
+      const factor = isBenefit ? project.actualFactor * wiggle(period, salt) : 1.04;
+      if (item.qty != null) {
+        const qty = Math.max(0, Math.round(item.qty * factor));
+        rows.push(ledgerRow(project, 'ACTUAL', period, item.cat, qty * item.rate,
+          { qty, rate: item.rate, note: `${item.note} (ผลจริง)` }));
+      } else {
+        const amount = Math.round((item.amount * factor) / 100) * 100;
+        rows.push(ledgerRow(project, 'ACTUAL', period, item.cat, amount, { note: `${item.note} (ผลจริง)` }));
+      }
+    }
   }
-  for (let m = 2; m <= 6; m++) {
-    push('ACTUAL', m, 'BEN001', 2, 52000, { note: `รายรับจริงเดือนที่ ${m}` });
-  }
-  push('ACTUAL', 3, 'BEN003', 2, null, {
-    unitQty: 100, unitCost: 350, note: 'ลดเวลาทำงานได้จริง (ต่ำกว่าที่ประมาณไว้)',
-  });
-  push('ACTUAL', 6, 'BEN006', 2, null, {
-    unitQty: 40, unitCost: 800, note: 'ลดข้อผิดพลาดจากการคีย์ข้อมูลซ้ำ',
-  });
-
-  return lines;
+  return rows;
 }
 
 async function seedProjectLedger(createdProjects) {
-  const rows = [];
-
-  for (const project of createdProjects) {
-    const hasActual = project.status === 'in_progress' || project.status === 'completed';
-
-    for (const line of buildLedgerLines(hasActual)) {
-      const total = line.unitQty != null ? line.unitQty * line.unitCost : line.value;
-      rows.push({
-        projectId: project.projectId,
-        phase: line.phase,
-        periodIndex: line.periodIndex,
-        typeId: line.typeId,
-        categoryId: line.categoryId,
-        unitQty: line.unitQty != null ? String(line.unitQty) : null,
-        unitCost: line.unitCost != null ? String(line.unitCost) : null,
-        amountBase: String(total),
-        totalValue: String(total),
-        transactionDate: periodDate(line.periodIndex),
-        note: line.note || '',
-        createdBy: project.owner.userId,
-      });
-    }
+  const rows = createdProjects.flatMap((p, i) => buildLedger(p, i));
+  // แบ่งส่งเป็นชุด กัน statement ใหญ่เกิน max_allowed_packet
+  for (let i = 0; i < rows.length; i += 200) {
+    await db.insert(projectLedger).values(rows.slice(i, i + 200));
   }
-
-  await db.insert(projectLedger).values(rows);
+  return rows.length;
 }
 
 async function main() {
   console.log('Resetting tables...');
   await resetTables();
 
-  console.log('Seeding master data (entry_types, project_types, categories, system_settings)...');
+  console.log('Seeding master data...');
   await seedEntryTypes();
   await seedProjectTypes();
   await seedCategories();
@@ -290,24 +327,17 @@ async function main() {
 
   console.log('Seeding users...');
   const createdUsers = await seedUsers();
-  // PROJECT_TEMPLATES only has entries for the 3 project_owner demo users — the admin user
-  // doesn't own projects or need project_access rows.
-  const projectOwners = createdUsers.filter(u => u.role === 'project_owner');
+  const owners = createdUsers.filter((u) => u.role === 'project_owner');
+  const audience = createdUsers.filter((u) => u.role === 'project_owner' || u.role === 'viewer');
 
   console.log('Seeding projects...');
-  const createdProjects = await seedProjects(projectOwners);
-
-  console.log('Seeding project_access...');
-  // โครงการสาธารณะต้องแชร์ให้บัญชี viewer ด้วย ไม่งั้นหน้า Community ของ viewer จะว่างเปล่า
-  const audience = createdUsers.filter((u) => u.role === 'project_owner' || u.role === 'viewer');
+  const createdProjects = await seedProjects(owners);
   await seedProjectAccess(createdProjects, audience);
+  const ledgerCount = await seedProjectLedger(createdProjects);
 
-  console.log('Seeding project_ledger...');
-  await seedProjectLedger(createdProjects);
-
-  console.log(`\nDone. ${createdUsers.length} users (${projectOwners.length} project owners + 1 admin), ${createdProjects.length} projects.`);
+  console.log(`\nDone. ${createdUsers.length} users, ${createdProjects.length} projects, ${ledgerCount} ledger rows.`);
   console.log(`Demo login password for every seeded user: ${DEMO_PASSWORD}`);
-  createdUsers.forEach((u) => console.log(`  - ${u.email}`));
+  createdUsers.forEach((u) => console.log(`  - ${u.email} (${u.role})`));
 }
 
 main()
