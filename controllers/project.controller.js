@@ -1,178 +1,241 @@
 // controllers/project.controller.js
 // จัดการ Logic ทั้งหมดของ Project และ Ledger API
+// ตรรกะการเงินอยู่ที่ services/finance.js, การตรวจ/กระจายรายการอยู่ที่ services/ledger-input.js
 
 const db = require('../config/db.config');
+const { analyzeProject, summarizeForList } = require('../services/finance');
+const { expandLedgerItems } = require('../services/ledger-input');
 
-// ── Schema v1.2 เก็บ phase เป็น 'ESTIMATED'/'ACTUAL' (ตัวใหญ่ทั้งหมด) แต่ API เดิม/frontend
-// ยังใช้ 'Estimated'/'Actual' — แปลงค่าตรงนี้ที่เดียว ไม่ต้องแก้ frontend ────────────────────
 // เพดานระยะเวลาโครงการ (10 ปี) — กันค่าที่ใหญ่เกินจริงจนรายงานรายเดือนยาวจนใช้งานไม่ได้
 const MAX_DURATION_MONTHS = 120;
+// target_roi_percent เป็น DECIMAL(5,2) เก็บได้ไม่เกิน 999.99
+const MAX_TARGET_ROI = 999.99;
 
+// Schema เก็บ phase เป็น 'ESTIMATED'/'ACTUAL' แต่ API/frontend ใช้ 'Estimated'/'Actual'
 const PHASE_TO_DB = { Estimated: 'ESTIMATED', Actual: 'ACTUAL' };
 const PHASE_FROM_DB = { ESTIMATED: 'Estimated', ACTUAL: 'Actual' };
 const mapLedgerPhase = (row) => ({ ...row, phase: PHASE_FROM_DB[row.phase] || row.phase });
 
-// คอลัมน์ ledger ที่ API ส่งกลับ (ใช้ร่วมกันทุก endpoint ที่อ่าน ledger)
+// สถานะโครงการที่ผู้ใช้ตั้งได้ (Should-Have: Project Status Management)
+//   planning    กำลังวางแผน — กรอกประมาณการ
+//   in_progress กำลังดำเนินการ — บันทึกผลจริงได้ (ระบบตั้งให้เองเมื่อบันทึกผลจริงครั้งแรก)
+//   completed   สิ้นสุดโครงการแล้ว — ล็อกข้อมูลไม่ให้แก้ จนกว่าจะเปลี่ยนสถานะกลับ
+const EDITABLE_STATUSES = ['planning', 'in_progress', 'completed'];
+const LOCKED_STATUSES = ['completed', 'archived'];
+
 const LEDGER_SELECT_COLUMNS = `
-  pl.ledger_id,
-  pl.project_id,
-  pl.phase,
-  pl.period_index,
-  pl.type_id,
-  pl.category_id,
-  pl.unit_qty,
-  pl.unit_cost,
-  pl.total_value,
-  pl.note,
-  pl.transaction_date,
-  pl.created_at,
-  c.category_name,
-  c.category_group,
-  et.type_name,
-  et.is_inflow
+  pl.ledger_id, pl.project_id, pl.phase, pl.period_index, pl.type_id, pl.category_id,
+  pl.unit_qty, pl.unit_cost, pl.total_value, pl.note, pl.transaction_date, pl.created_at,
+  c.category_name, c.category_group, c.unit_label, c.rate_label,
+  et.type_name, et.is_inflow
 `;
 
-// ── ตรวจสิทธิ์เข้าถึงโปรเจกต์ ────────────────────────────────────────────────
-// เงื่อนไขที่ใช้ร่วมกันทุก query: "สาธารณะ" = มีการแชร์สิทธิ์ viewer ให้คนอื่นอย่างน้อยหนึ่งคน
-//
-// เดิมตรวจว่า "ต้องมีแถว project_access ของ user คนนี้" ซึ่งพังเมื่อเจ้าของกดเปิดสาธารณะไปแล้ว
-// ค่อยมีผู้ใช้สมัครเข้ามาทีหลัง — คนใหม่จะไม่มีแถวนั้น เลยมองไม่เห็นโปรเจกต์สาธารณะเลย
-// ทั้งที่ควรเห็น ตอนนี้จึงเช็คจาก "สถานะสาธารณะของตัวโปรเจกต์" แทนการเช็ครายคน
+// "สาธารณะ" = มีการแชร์สิทธิ์ viewer ให้คนอื่นอย่างน้อยหนึ่งคน — เช็คจากตัวโปรเจกต์ ไม่ใช่รายคน
+// (ถ้าเช็ครายคน ผู้ใช้ที่สมัครหลังจากเจ้าของกดเปิดสาธารณะจะมองไม่เห็นโปรเจกต์นั้นเลย)
 const IS_PUBLIC_SQL = `EXISTS(
   SELECT 1 FROM project_access pa
   WHERE pa.project_id = p.project_id AND pa.user_id <> p.user_id AND pa.permission_level = 'viewer'
 )`;
 
-// อ่าน: เจ้าของ / คนที่ถูกแชร์ให้โดยตรง / หรือโปรเจกต์นั้นเปิดสาธารณะอยู่
-async function canReadProject(projectId, userId) {
-  const [[row]] = await db.query(
-    `SELECT 1 AS ok FROM projects p
-     WHERE p.project_id = ?
-       AND (
-         p.user_id = ?
-         OR EXISTS(SELECT 1 FROM project_access pa WHERE pa.project_id = p.project_id AND pa.user_id = ?)
-         OR ${IS_PUBLIC_SQL}
-       )`,
-    [projectId, userId, userId]
-  );
-  return !!row;
+// อ่านได้: เจ้าของ / คนที่ถูกแชร์ให้โดยตรง / หรือโปรเจกต์เปิดสาธารณะอยู่
+const CAN_READ_SQL = `(
+  p.user_id = ?
+  OR EXISTS(SELECT 1 FROM project_access pa WHERE pa.project_id = p.project_id AND pa.user_id = ?)
+  OR ${IS_PUBLIC_SQL}
+)`;
+
+const HAS_ACTUAL_SQL = `EXISTS(
+  SELECT 1 FROM project_ledger pl WHERE pl.project_id = p.project_id AND pl.phase = 'ACTUAL'
+)`;
+
+// คอลัมน์โปรเจกต์ที่ทุก endpoint ส่งกลับ
+const PROJECT_COLUMNS = `
+  p.project_id, p.project_name, p.duration_months, p.initial_budget, p.target_roi_percent,
+  p.project_type_id, p.user_id, p.created_at,
+  p.status AS project_status,
+  ${IS_PUBLIC_SQL} AS is_public,
+  pt.type_name AS project_type,
+  pt.calculation_method,
+  CASE WHEN ${HAS_ACTUAL_SQL} THEN 'Actual' ELSE 'Estimated' END AS status
+`;
+
+const num = (v) => Number(v) || 0;
+
+function badRequest(res, message) {
+  return res.status(400).json({ status: 'error', message });
 }
 
-async function getProjectDuration(projectId) {
-  const [[row]] = await db.query('SELECT duration_months FROM projects WHERE project_id = ?', [projectId]);
-  return Number(row?.duration_months) || 12;
+function notFound(res) {
+  // ทั้ง "ไม่มี project" และ "project ของคนอื่น" ตอบ 404 เหมือนกัน ไม่บอกว่า id นั้นมีอยู่จริงไหม
+  return res.status(404).json({ status: 'error', message: 'Project not found' });
 }
 
-// เขียน: เจ้าของเท่านั้น — คนที่ถูกแชร์ให้ดูแก้ข้อมูลไม่ได้
-async function isProjectOwner(projectId, userId) {
+async function getOwnedProject(projectId, userId) {
   const [[row]] = await db.query(
-    'SELECT 1 AS ok FROM projects WHERE project_id = ? AND user_id = ?',
+    `SELECT p.project_id, p.duration_months, p.created_at, p.status
+     FROM projects p WHERE p.project_id = ? AND p.user_id = ?`,
     [projectId, userId]
   );
-  return !!row;
+  return row || null;
 }
 
-// บันทึก ledger หนึ่งแถว — ใช้ร่วมกันทั้งตอน create และ update ทั้ง 2 phase
-// FR03-2: period_index = งวด/เดือนที่ของรายการ (1..duration_months)
-// FR03-4: ผลประโยชน์ทางอ้อมเก็บ unit_qty (ปริมาณที่ลดได้) × unit_cost (อัตรา/ต้นทุนต่อหน่วย)
-//         โดย total_value คำนวณจาก qty × cost ถ้าส่งทั้งคู่มา
-// ตรวจว่า category_id / type_id ที่ส่งมามีอยู่จริงก่อน insert — ถ้าปล่อยให้ FK error เอง
-// จะได้ 500 พร้อมข้อความกว้างๆ ที่ผู้ใช้ไม่รู้ว่าผิดตรงไหน
-async function validateLedgerRefs(ledgers) {
-  const categoryIds = [...new Set(ledgers.map((l) => l.category_id).filter(Boolean))];
-  const typeIds = [...new Set(ledgers.map((l) => Number(l.type_id)).filter(Boolean))];
+async function hasActualData(projectId, conn = db) {
+  const [[{ n }]] = await conn.query(
+    "SELECT COUNT(*) AS n FROM project_ledger WHERE project_id = ? AND phase = 'ACTUAL'",
+    [projectId]
+  );
+  return n > 0;
+}
 
-  if (categoryIds.length > 0) {
-    const [rows] = await db.query('SELECT category_id FROM categories WHERE category_id IN (?)', [categoryIds]);
-    const found = new Set(rows.map((r) => r.category_id));
-    const missing = categoryIds.filter((id) => !found.has(id));
-    if (missing.length > 0) return `ไม่พบหมวดหมู่: ${missing.join(', ')}`;
+async function loadCategoryMap(items) {
+  const ids = [...new Set((items || []).map((i) => i && i.category_id).filter(Boolean))];
+  if (ids.length === 0) return new Map();
+  const [rows] = await db.query(
+    `SELECT c.category_id, c.category_name, c.type_id, c.category_group, c.unit_label, c.rate_label, et.is_inflow
+     FROM categories c LEFT JOIN entry_types et ON c.type_id = et.type_id
+     WHERE c.category_id IN (?)`,
+    [ids]
+  );
+  return new Map(rows.map((r) => [r.category_id, r]));
+}
+
+// ตรวจข้อมูลพื้นฐานของโครงการ ใช้ร่วมกันทั้งตอนสร้างและแก้ไข (ค่า undefined = ไม่ได้ส่งมา ข้ามได้)
+function validateProjectFields({ project_name, duration_months, initial_budget, target_roi_percent }, isCreate) {
+  if (isCreate || project_name !== undefined) {
+    if (!project_name || !String(project_name).trim()) return 'กรุณากรอกชื่อโครงการ';
+    if (String(project_name).trim().length > 255) return 'ชื่อโครงการยาวเกิน 255 ตัวอักษร';
   }
-
-  if (typeIds.length > 0) {
-    const [rows] = await db.query('SELECT type_id FROM entry_types WHERE type_id IN (?)', [typeIds]);
-    const found = new Set(rows.map((r) => Number(r.type_id)));
-    const missing = typeIds.filter((id) => !found.has(id));
-    if (missing.length > 0) return `ไม่พบประเภทรายการ: ${missing.join(', ')}`;
+  if (duration_months !== undefined && duration_months !== null) {
+    const d = Number(duration_months);
+    if (!Number.isInteger(d) || d < 1 || d > MAX_DURATION_MONTHS) {
+      return `ระยะเวลาโครงการต้องเป็นจำนวนเต็มระหว่าง 1–${MAX_DURATION_MONTHS} เดือน`;
+    }
   }
-
+  if (isCreate || initial_budget !== undefined) {
+    const b = Number(initial_budget);
+    if (!Number.isFinite(b) || b <= 0) return 'งบลงทุนเริ่มต้นต้องมากกว่า 0';
+  }
+  if (target_roi_percent !== undefined && target_roi_percent !== null && target_roi_percent !== '') {
+    const t = Number(target_roi_percent);
+    if (!Number.isFinite(t) || t < 0 || t > MAX_TARGET_ROI) {
+      return `เป้าหมาย ROI ต้องอยู่ระหว่าง 0–${MAX_TARGET_ROI}%`;
+    }
+  }
   return null;
 }
 
-async function insertLedgerRow(projectId, dbPhase, item, fallbackDate, createdBy, maxPeriod) {
-  const qty = item.unit_qty != null && item.unit_qty !== '' ? Number(item.unit_qty) : null;
-  const cost = item.unit_cost != null && item.unit_cost !== '' ? Number(item.unit_cost) : null;
-  const total = qty != null && cost != null ? qty * cost : Number(item.total_value) || 0;
-  // งวดต้องอยู่ในช่วง 1..ระยะเวลาโครงการ — กันข้อมูลที่ยิงตรงมาที่ API ด้วยงวดเกินจริง
-  // ซึ่งจะทำให้ตารางรายเดือนในรายงานยืดออกไปเป็นร้อยแถว
-  const period = Math.min(Math.max(1, Number(item.period_index) || 1), maxPeriod || 12);
-
-  await db.query(
+async function insertLedgerRows(conn, projectId, dbPhase, rows, createdBy) {
+  if (rows.length === 0) return;
+  await conn.query(
     `INSERT INTO project_ledger
        (project_id, phase, period_index, type_id, category_id,
         unit_qty, unit_cost, amount_base, total_value, transaction_date, note, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES ?`,
     [
-      projectId,
-      dbPhase,
-      period,
-      item.type_id,
-      item.category_id,
-      qty,
-      cost,
-      total,
-      total,
-      item.transaction_date || fallbackDate,
-      item.note || '',
-      createdBy || null
+      rows.map((r) => [
+        projectId, dbPhase, r.period_index, r.type_id, r.category_id,
+        r.unit_qty, r.unit_cost, r.total_value, r.total_value, r.transaction_date, r.note, createdBy || null,
+      ]),
     ]
   );
 }
 
+// ปรับสถานะให้สอดคล้องกับข้อมูลหลังบันทึกผลจริง: บันทึกผลจริงครั้งแรก → กำลังดำเนินการ,
+// ลบผลจริงออกหมด → กลับไปกำลังวางแผน
+async function syncStatusAfterActual(conn, projectId) {
+  const [[p]] = await conn.query('SELECT status FROM projects WHERE project_id = ?', [projectId]);
+  const hasActual = await hasActualData(projectId, conn);
+  if (hasActual && p.status === 'planning') {
+    await conn.query("UPDATE projects SET status = 'in_progress' WHERE project_id = ?", [projectId]);
+  } else if (!hasActual && p.status !== 'planning') {
+    await conn.query("UPDATE projects SET status = 'planning' WHERE project_id = ?", [projectId]);
+  }
+}
+
+// แทนที่ ledger ของ phase หนึ่งทั้งหมดใน transaction เดียว — ถ้าขั้นไหนพัง ข้อมูลเดิมต้องไม่หาย
+async function replaceLedgers(projectId, dbPhase, rows, userId, { append = false } = {}) {
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (!append) {
+      await conn.query('DELETE FROM project_ledger WHERE project_id = ? AND phase = ?', [projectId, dbPhase]);
+    }
+    await insertLedgerRows(conn, projectId, dbPhase, rows, userId);
+    if (dbPhase === 'ACTUAL') await syncStatusAfterActual(conn, projectId);
+    await conn.commit();
+  } catch (error) {
+    await conn.rollback();
+    throw error;
+  } finally {
+    conn.release();
+  }
+}
+
+// ตรวจสิทธิ์ + สถานะ + ข้อมูล แล้วคืนแถวที่พร้อมบันทึก (ใช้ร่วมกันทั้ง 3 endpoint ที่เขียน ledger)
+async function prepareLedgerWrite(req, res, { requireRows }) {
+  const project = await getOwnedProject(req.params.id, req.user.userId);
+  if (!project) {
+    notFound(res);
+    return null;
+  }
+  if (LOCKED_STATUSES.includes(project.status)) {
+    badRequest(res, 'โครงการนี้สิ้นสุดแล้ว — เปลี่ยนสถานะเป็น "กำลังดำเนินการ" ก่อนจึงจะแก้ไขข้อมูลได้');
+    return null;
+  }
+
+  const items = req.body.ledgers;
+  if (!Array.isArray(items) || (requireRows && items.length === 0)) {
+    badRequest(res, 'กรุณาระบุข้อมูลรายการ');
+    return null;
+  }
+
+  const categories = await loadCategoryMap(items);
+  const { rows, error } = expandLedgerItems(items, categories, project);
+  if (error) {
+    badRequest(res, error);
+    return null;
+  }
+  return { project, rows };
+}
+
 // ══════════════════════════════════════════════════════════
-// 1. GET /api/projects — ดึงโปรเจกต์ทั้งหมด
+// 1. GET /api/projects — โปรเจกต์ของผู้ใช้ พร้อมตัวชี้วัดสรุป (คำนวณฝั่ง server ด้วยสูตรเดียวกับรายงาน)
 // ══════════════════════════════════════════════════════════
 exports.getAllProjects = async (req, res) => {
   try {
-    // ── Security Fix #1 ─────────────────────────────────────────────────────
-    // อ่าน userId จาก JWT ที่ verifyToken decode ไว้แล้วใน req.user
-    // → ดึงเฉพาะโปรเจกต์ที่เป็นของ user คนนี้เท่านั้น
     const userId = req.user.userId;
 
-    const sql = `
-      SELECT
-        p.project_id,
-        p.project_name,
-        p.duration_months,
-        p.initial_budget,
-        p.target_roi_percent,
-        p.project_type_id,
-        p.user_id,
-        p.created_at,
-        EXISTS(
-          SELECT 1 FROM project_access pa
-          WHERE pa.project_id = p.project_id AND pa.user_id <> p.user_id AND pa.permission_level = 'viewer'
-        ) AS is_public,
-        pt.type_name AS project_type,
-        CASE WHEN EXISTS(
-          SELECT 1 FROM project_ledger pl
-          WHERE pl.project_id = p.project_id AND pl.phase = 'ACTUAL'
-        ) THEN 'Actual' ELSE 'Estimated' END AS status
-      FROM projects p
-      LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
-      WHERE p.user_id = ?
-      ORDER BY p.created_at DESC
-    `;
+    const [projects] = await db.query(
+      `SELECT ${PROJECT_COLUMNS}
+       FROM projects p
+       LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
+       WHERE p.user_id = ?
+       ORDER BY p.created_at DESC`,
+      [userId]
+    );
 
-    // ส่ง userId เป็น prepared statement parameter (ป้องกัน SQL Injection)
-    const [rows] = await db.query(sql, [userId]);
+    // ดึงยอดรวมรายเดือนของทุกโปรเจกต์ในครั้งเดียว แล้วส่งให้ finance คำนวณทีละโปรเจกต์
+    const [ledgerRows] = await db.query(
+      `SELECT pl.project_id, pl.phase, pl.period_index, pl.category_id,
+              c.category_name, c.category_group, et.is_inflow,
+              SUM(pl.total_value) AS total_value
+       FROM project_ledger pl
+       INNER JOIN projects p ON pl.project_id = p.project_id AND p.user_id = ?
+       LEFT JOIN categories c ON pl.category_id = c.category_id
+       LEFT JOIN entry_types et ON pl.type_id = et.type_id
+       GROUP BY pl.project_id, pl.phase, pl.period_index, pl.category_id,
+                c.category_name, c.category_group, et.is_inflow`,
+      [userId]
+    );
 
-    res.json({
-      status: 'success',
-      message: 'Projects retrieved successfully',
-      data: rows
-    });
+    const byProject = new Map();
+    for (const r of ledgerRows) {
+      if (!byProject.has(r.project_id)) byProject.set(r.project_id, []);
+      byProject.get(r.project_id).push(r);
+    }
 
+    const data = projects.map((p) => ({ ...p, ...summarizeForList(p, byProject.get(p.project_id) || []) }));
+    res.json({ status: 'success', message: 'Projects retrieved successfully', data });
   } catch (error) {
     console.error('[Project] getAllProjects Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to retrieve projects' });
@@ -180,53 +243,21 @@ exports.getAllProjects = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 2. GET /api/projects/:id — ดึงโปรเจกต์เดียวตาม ID
+// 2. GET /api/projects/:id
 // ══════════════════════════════════════════════════════════
 exports.getProjectById = async (req, res) => {
   try {
-    const { id } = req.params;
-    // ── Security Fix #2 ─────────────────────────────────────────────────────
-    // อนุญาตให้ดูได้ทั้งเจ้าของโปรเจกต์เอง หรือ user ที่มีสิทธิ์ใน project_access (เช่น
-    // viewer ของโปรเจกต์ public ที่เห็นใน Community) — ป้องกัน User B เรียกดูโปรเจกต์ของ
-    // User A ที่ไม่ได้แชร์ไว้ ถ้าไม่พบหรือไม่มีสิทธิ์ → 404 เหมือนกัน (ไม่บอกว่ามีอยู่จริงหรือเปล่า)
     const userId = req.user.userId;
-
-    const sql = `
-      SELECT
-        p.project_id, p.project_name, p.duration_months,
-        p.initial_budget, p.target_roi_percent, p.project_type_id,
-        p.user_id, p.created_at,
-        EXISTS(
-          SELECT 1 FROM project_access pa
-          WHERE pa.project_id = p.project_id AND pa.user_id <> p.user_id AND pa.permission_level = 'viewer'
-        ) AS is_public,
-        pt.type_name AS project_type,
-        u.full_name AS owner_name,
-        CASE WHEN EXISTS(
-          SELECT 1 FROM project_ledger pl
-          WHERE pl.project_id = p.project_id AND pl.phase = 'ACTUAL'
-        ) THEN 'Actual' ELSE 'Estimated' END AS status
-      FROM projects p
-      LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
-      LEFT JOIN users u ON p.user_id = u.user_id
-      WHERE p.project_id = ?
-        AND (
-          p.user_id = ?
-          OR EXISTS(SELECT 1 FROM project_access pa WHERE pa.project_id = p.project_id AND pa.user_id = ?)
-          OR ${IS_PUBLIC_SQL}
-        )
-    `;
-
-    const [rows] = await db.query(sql, [id, userId, userId]);
-
-    if (rows.length === 0) {
-      // ทั้งกรณี "ไม่มี project" และ "project ของคนอื่น" ตอบ 404 เหมือนกัน
-      // เพื่อป้องกัน Information Leakage (ไม่ให้รู้ว่า ID นั้นมีอยู่ในระบบหรือไม่)
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
-    }
-
+    const [rows] = await db.query(
+      `SELECT ${PROJECT_COLUMNS}, u.full_name AS owner_name
+       FROM projects p
+       LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
+       LEFT JOIN users u ON p.user_id = u.user_id
+       WHERE p.project_id = ? AND ${CAN_READ_SQL}`,
+      [req.params.id, userId, userId]
+    );
+    if (rows.length === 0) return notFound(res);
     res.json({ status: 'success', data: rows[0] });
-
   } catch (error) {
     console.error('[Project] getProjectById Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to retrieve project' });
@@ -234,31 +265,19 @@ exports.getProjectById = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 2.5. GET /api/projects/community — โปรเจกต์ public ของคนอื่นที่แชร์ให้เราดู (viewer)
+// 2.5. GET /api/projects/community — โปรเจกต์สาธารณะของคนอื่น
 // ══════════════════════════════════════════════════════════
 exports.getCommunityProjects = async (req, res) => {
   try {
-    const userId = req.user.userId;
-
-    const sql = `
-      SELECT
-        p.project_id, p.project_name, p.duration_months,
-        p.initial_budget, p.user_id, p.created_at,
-        pt.type_name AS project_type,
-        u.full_name AS owner_name,
-        CASE WHEN EXISTS(
-          SELECT 1 FROM project_ledger pl
-          WHERE pl.project_id = p.project_id AND pl.phase = 'ACTUAL'
-        ) THEN 'Actual' ELSE 'Estimated' END AS status
-      FROM projects p
-      LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
-      LEFT JOIN users u ON p.user_id = u.user_id
-      WHERE p.user_id <> ? AND ${IS_PUBLIC_SQL}
-      ORDER BY p.created_at DESC
-    `;
-
-    const [rows] = await db.query(sql, [userId]);
-
+    const [rows] = await db.query(
+      `SELECT ${PROJECT_COLUMNS}, u.full_name AS owner_name
+       FROM projects p
+       LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
+       LEFT JOIN users u ON p.user_id = u.user_id
+       WHERE p.user_id <> ? AND ${IS_PUBLIC_SQL}
+       ORDER BY p.created_at DESC`,
+      [req.user.userId]
+    );
     res.json({ status: 'success', data: rows });
   } catch (error) {
     console.error('[Project] getCommunityProjects Error:', error);
@@ -271,36 +290,28 @@ exports.getCommunityProjects = async (req, res) => {
 // ══════════════════════════════════════════════════════════
 exports.createProject = async (req, res) => {
   try {
-    // หมายเหตุ: schema v1.2 ไม่มีคอลัมน์ custom_project_type แล้ว (ถ้า frontend ส่งมาจะถูกละเว้น)
-    // FR02-1: เป้าหมาย ROI (target_roi_percent) เป็นข้อมูลพื้นฐานของโครงการด้วย
     const { project_name, project_type_id, duration_months, initial_budget, target_roi_percent } = req.body;
+    const userId = req.user?.userId;
+    if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized: ไม่พบข้อมูล User' });
 
-    const user_id = req.user?.userId;
-    if (!user_id) {
-      return res.status(401).json({ status: 'error', message: 'Unauthorized: ไม่พบข้อมูล User' });
+    const invalid = validateProjectFields(req.body, true);
+    if (invalid) return badRequest(res, invalid);
+
+    if (project_type_id != null) {
+      const [[type]] = await db.query('SELECT type_id FROM project_types WHERE type_id = ?', [project_type_id]);
+      if (!type) return badRequest(res, 'ไม่พบประเภทโครงการที่เลือก');
     }
 
-    if (!project_name || !initial_budget) {
-      return res.status(400).json({ status: 'error', message: 'กรุณากรอกข้อมูลให้ครบ' });
-    }
-    if (duration_months != null && (Number(duration_months) < 1 || Number(duration_months) > MAX_DURATION_MONTHS)) {
-      return res.status(400).json({
-        status: 'error',
-        message: `ระยะเวลาโครงการต้องอยู่ระหว่าง 1–${MAX_DURATION_MONTHS} เดือน`
-      });
-    }
-
-    // project_id เป็น AUTO_INCREMENT แล้ว ไม่ต้องหา MAX(project_id)+1 เอง
     const [result] = await db.query(
-      `INSERT INTO projects (user_id, project_name, project_type_id, duration_months, initial_budget, target_roi_percent)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO projects (user_id, project_name, project_type_id, duration_months, initial_budget, target_roi_percent, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'planning')`,
       [
-        user_id,
-        project_name,
+        userId,
+        String(project_name).trim(),
         project_type_id || 1,
         duration_months || 12,
         initial_budget,
-        target_roi_percent != null && target_roi_percent !== '' ? target_roi_percent : null
+        target_roi_percent != null && target_roi_percent !== '' ? target_roi_percent : null,
       ]
     );
     const newProjectId = result.insertId;
@@ -308,15 +319,10 @@ exports.createProject = async (req, res) => {
     // เจ้าของโปรเจกต์ต้องมีแถวใน project_access เสมอ (permission_level = 'owner')
     await db.query(
       `INSERT INTO project_access (project_id, user_id, permission_level) VALUES (?, ?, 'owner')`,
-      [newProjectId, user_id]
+      [newProjectId, userId]
     );
 
-    res.status(201).json({
-      status: 'success',
-      message: 'สร้างโปรเจกต์สำเร็จ',
-      data: { project_id: newProjectId }
-    });
-
+    res.status(201).json({ status: 'success', message: 'สร้างโปรเจกต์สำเร็จ', data: { project_id: newProjectId } });
   } catch (error) {
     console.error('[Project] createProject Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to create project' });
@@ -324,44 +330,43 @@ exports.createProject = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 3.5. PUT /api/projects/:id — แก้ไขข้อมูลพื้นฐานของโครงการ (FR02-2)
+// 3.5. PUT /api/projects/:id — แก้ไขข้อมูลพื้นฐานและสถานะของโครงการ
 // ══════════════════════════════════════════════════════════
 exports.updateProject = async (req, res) => {
   try {
     const { id } = req.params;
-    const userId = req.user.userId;
-    const { project_name, project_type_id, duration_months, initial_budget, target_roi_percent } = req.body;
+    const { project_name, project_type_id, duration_months, initial_budget, target_roi_percent, status } = req.body;
 
-    const [[project]] = await db.query(
-      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
-      [id, userId]
-    );
-    if (!project) {
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
+    const project = await getOwnedProject(id, req.user.userId);
+    if (!project) return notFound(res);
+
+    const invalid = validateProjectFields(req.body, false);
+    if (invalid) return badRequest(res, invalid);
+
+    if (project_type_id != null) {
+      const [[type]] = await db.query('SELECT type_id FROM project_types WHERE type_id = ?', [project_type_id]);
+      if (!type) return badRequest(res, 'ไม่พบประเภทโครงการที่เลือก');
     }
 
-    if (project_name != null && !String(project_name).trim()) {
-      return res.status(400).json({ status: 'error', message: 'ชื่อโครงการห้ามเว้นว่าง' });
-    }
-    // จำกัดเพดานไว้ด้วย ไม่งั้นใส่ 999 เดือนแล้วตารางรายเดือน/dropdown เลือกงวดจะยาวจนหน้าค้าง
-    if (duration_months != null && (Number(duration_months) < 1 || Number(duration_months) > MAX_DURATION_MONTHS)) {
-      return res.status(400).json({
-        status: 'error',
-        message: `ระยะเวลาโครงการต้องอยู่ระหว่าง 1–${MAX_DURATION_MONTHS} เดือน`
-      });
-    }
-
-    // ระยะเวลาโครงการสั้นลงจนมีรายการบันทึกไว้เกินงวดสุดท้าย จะทำให้ข้อมูลเดือนนั้นหายไปจากรายงาน
+    // ลดระยะเวลาจนมีรายการเกินงวดสุดท้าย จะทำให้ข้อมูลเดือนนั้นหายไปจากรายงาน
     if (duration_months != null) {
       const [[{ maxPeriod }]] = await db.query(
         'SELECT COALESCE(MAX(period_index), 0) AS maxPeriod FROM project_ledger WHERE project_id = ?',
         [id]
       );
       if (maxPeriod > Number(duration_months)) {
-        return res.status(400).json({
-          status: 'error',
-          message: `ลดระยะเวลาโครงการไม่ได้ — มีรายการบันทึกไว้ถึงเดือนที่ ${maxPeriod} แล้ว`
-        });
+        return badRequest(res, `ลดระยะเวลาโครงการไม่ได้ — มีรายการบันทึกไว้ถึงเดือนที่ ${maxPeriod} แล้ว`);
+      }
+    }
+
+    if (status !== undefined && status !== null) {
+      if (!EDITABLE_STATUSES.includes(status)) return badRequest(res, 'สถานะโครงการไม่ถูกต้อง');
+      const hasActual = await hasActualData(id);
+      if (status === 'completed' && !hasActual) {
+        return badRequest(res, 'ต้องบันทึกผลการดำเนินงานจริงก่อน จึงจะปิดโครงการ (สิ้นสุดโครงการ) ได้');
+      }
+      if (status === 'planning' && hasActual) {
+        return badRequest(res, 'โครงการนี้มีผลการดำเนินงานจริงแล้ว จึงกลับไปสถานะกำลังวางแผนไม่ได้');
       }
     }
 
@@ -371,15 +376,19 @@ exports.updateProject = async (req, res) => {
          project_type_id = COALESCE(?, project_type_id),
          duration_months = COALESCE(?, duration_months),
          initial_budget = COALESCE(?, initial_budget),
-         target_roi_percent = ?
+         target_roi_percent = IF(?, ?, target_roi_percent),
+         status = COALESCE(?, status)
        WHERE project_id = ?`,
       [
         project_name != null ? String(project_name).trim() : null,
         project_type_id ?? null,
         duration_months ?? null,
         initial_budget ?? null,
+        // ไม่ได้ส่ง target_roi_percent มา (เช่นเปลี่ยนแค่สถานะ) = คงค่าเดิม, ส่ง null/ว่าง = ล้างเป้าหมาย
+        target_roi_percent !== undefined,
         target_roi_percent != null && target_roi_percent !== '' ? target_roi_percent : null,
-        id
+        status ?? null,
+        id,
       ]
     );
 
@@ -391,63 +400,47 @@ exports.updateProject = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 4. DELETE /api/projects/:id — ลบโปรเจกต์และ Ledger
+// 4. DELETE /api/projects/:id
 // ══════════════════════════════════════════════════════════
 exports.deleteProject = async (req, res) => {
+  const { id } = req.params;
+  const conn = await db.getConnection();
   try {
-    const { id } = req.params;
-    // ── Security Fix #4 ─────────────────────────────────────────────────────
-    // ตรวจ ownership ก่อนลบ — ป้องกัน User B ส่ง DELETE /api/projects/101
-    // แล้วลบโปรเจกต์ของ User A ได้
-    const userId = req.user.userId;
+    const project = await getOwnedProject(id, req.user.userId);
+    if (!project) return notFound(res);
 
-    // ค้นหาว่า project นี้มีอยู่จริงและเป็นของ user คนนี้หรือไม่
-    const [[project]] = await db.query(
-      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
-      [id, userId]
-    );
-
-    if (!project) {
-      // ทั้งกรณี "ไม่มี project" และ "project ของคนอื่น" ตอบ 404 เหมือนกัน
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
-    }
-
-    // ต้องลบ project_ledger และ project_access ก่อนเสมอ เพราะมี Foreign Key อ้างถึง
-    // projects.project_id — ถ้าลบ projects ก่อน จะเกิด FK Constraint Error
-    await db.query('DELETE FROM project_ledger WHERE project_id = ?', [id]);
-    await db.query('DELETE FROM project_access WHERE project_id = ?', [id]);
-    await db.query('DELETE FROM projects WHERE project_id = ?', [id]);
+    // ต้องลบ ledger/access ก่อน projects เพราะมี Foreign Key อ้างถึง
+    await conn.beginTransaction();
+    await conn.query('DELETE FROM project_ledger WHERE project_id = ?', [id]);
+    await conn.query('DELETE FROM project_access WHERE project_id = ?', [id]);
+    await conn.query('DELETE FROM projects WHERE project_id = ?', [id]);
+    await conn.commit();
 
     res.json({ status: 'success', message: 'ลบโปรเจกต์สำเร็จ' });
-
   } catch (error) {
+    await conn.rollback();
     console.error('[Project] deleteProject Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to delete project' });
+  } finally {
+    conn.release();
   }
 };
 
 // ══════════════════════════════════════════════════════════
-// 4.5. GET /api/projects/ledgers — ดึง Ledger ทั้งหมดในระบบ
+// 4.5. GET /api/projects/ledgers — Ledger ทั้งหมดของผู้ใช้
 // ══════════════════════════════════════════════════════════
 exports.getAllLedgers = async (req, res) => {
   try {
-    // ── Security Fix #5 ─────────────────────────────────────────────────────
-    // กรองเฉพาะ Ledger ของโปรเจกต์ที่เป็นของ user คนนี้
-    // JOIN กับ projects เพื่อตรวจ user_id — ไม่ดึง ledger ของคนอื่น
-    const userId = req.user.userId;
-
-    const sql = `
-      SELECT ${LEDGER_SELECT_COLUMNS}
-      FROM project_ledger pl
-      INNER JOIN projects p ON pl.project_id = p.project_id AND p.user_id = ?
-      LEFT JOIN categories c ON pl.category_id = c.category_id
-      LEFT JOIN entry_types et ON pl.type_id = et.type_id
-      ORDER BY pl.ledger_id ASC
-    `;
-
-    const [rows] = await db.query(sql, [userId]);
+    const [rows] = await db.query(
+      `SELECT ${LEDGER_SELECT_COLUMNS}
+       FROM project_ledger pl
+       INNER JOIN projects p ON pl.project_id = p.project_id AND p.user_id = ?
+       LEFT JOIN categories c ON pl.category_id = c.category_id
+       LEFT JOIN entry_types et ON pl.type_id = et.type_id
+       ORDER BY pl.ledger_id ASC`,
+      [req.user.userId]
+    );
     res.json({ status: 'success', data: rows.map(mapLedgerPhase) });
-
   } catch (error) {
     console.error('[Project] getAllLedgers Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to retrieve all ledgers' });
@@ -455,32 +448,27 @@ exports.getAllLedgers = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 5. GET /api/projects/:id/ledgers — ดึง Ledger รายโปรเจกต์
+// 5. GET /api/projects/:id/ledgers
 // ══════════════════════════════════════════════════════════
 exports.getLedgersByProject = async (req, res) => {
   try {
-    const { id } = req.params;
+    const userId = req.user.userId;
+    const [[readable]] = await db.query(
+      `SELECT 1 AS ok FROM projects p WHERE p.project_id = ? AND ${CAN_READ_SQL}`,
+      [req.params.id, userId, userId]
+    );
+    if (!readable) return notFound(res);
 
-    // ต้องเป็นเจ้าของหรือถูกแชร์ให้ดูเท่านั้น ไม่งั้นใครก็ตามที่ login แล้วจะอ่าน ledger
-    // ของโปรเจกต์ส่วนตัวคนอื่นได้ด้วยการเดา id
-    if (!(await canReadProject(id, req.user.userId))) {
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
-    }
-
-    // JOIN กับ categories และ entry_types เพื่อดึงชื่อ (ไม่ใช่แค่ ID)
-    const sql = `
-      SELECT ${LEDGER_SELECT_COLUMNS}
-      FROM project_ledger pl
-      LEFT JOIN categories c ON pl.category_id = c.category_id
-      LEFT JOIN entry_types et ON pl.type_id = et.type_id
-      WHERE pl.project_id = ?
-      ORDER BY pl.phase DESC, pl.period_index ASC, pl.type_id ASC
-    `;
-
-    const [rows] = await db.query(sql, [id]);
-
+    const [rows] = await db.query(
+      `SELECT ${LEDGER_SELECT_COLUMNS}
+       FROM project_ledger pl
+       LEFT JOIN categories c ON pl.category_id = c.category_id
+       LEFT JOIN entry_types et ON pl.type_id = et.type_id
+       WHERE pl.project_id = ?
+       ORDER BY pl.phase DESC, pl.category_id ASC, pl.period_index ASC, pl.ledger_id ASC`,
+      [req.params.id]
+    );
     res.json({ status: 'success', data: rows.map(mapLedgerPhase) });
-
   } catch (error) {
     console.error('[Project] getLedgersByProject Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to retrieve ledgers' });
@@ -488,208 +476,56 @@ exports.getLedgersByProject = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 5.5. GET /api/projects/:id/analytics — ประมวลผลและคำนวณทั้งหมดของโครงการ
-//
-// รวม FR04 (คำนวณ) และ FR05 (วิเคราะห์) ไว้ที่เดียว คำนวณฝั่ง server เพื่อให้ทุกหน้า
-// (รายงาน/แดชบอร์ด/กราฟ) ได้ตัวเลขชุดเดียวกันเสมอ:
-//   FR04-1 Net Cash Flow (NCF) และกระแสเงินสดสะสมรายเดือน
-//   FR04-2 ROI = ((ผลประโยชน์รวม - ต้นทุนรวม) / ต้นทุนรวม) × 100
-//   FR04-3 ระยะเวลาคืนทุน = เดือนแรกที่กระแสเงินสดสะสม >= เงินลงทุนเริ่มต้น
-//   FR04-4 สถานะ คุ้มค่า/ไม่คุ้มค่า เทียบ ROI กับเป้าหมายที่ตั้งไว้
-//   FR05-2 ส่วนต่าง (variance) ระหว่างคาดการณ์กับจริง ทั้งรายเดือนและสะสม
+// 5.5. GET /api/projects/:id/analytics — ตัวชี้วัดทั้งหมดของโครงการ (ดู services/finance.js)
 // ══════════════════════════════════════════════════════════
-const num = (v) => Number(v) || 0;
-
-// FR04-2: ต้นทุนรวมเป็น 0 แปลว่ายังไม่มีข้อมูลต้นทุน คืน 0 แทนการหารด้วยศูนย์
-function calcRoi(totalBenefit, totalCost) {
-  if (totalCost <= 0) return 0;
-  return ((totalBenefit - totalCost) / totalCost) * 100;
+async function loadAnalysisProject(projectId, userId) {
+  const [[project]] = await db.query(
+    `SELECT p.project_id, p.project_name, p.duration_months, p.initial_budget, p.target_roi_percent,
+            p.user_id, p.created_at, p.status AS project_status,
+            pt.type_name AS project_type, pt.calculation_method
+     FROM projects p
+     LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
+     WHERE p.project_id = ? AND ${CAN_READ_SQL}`,
+    [projectId, userId, userId]
+  );
+  return project || null;
 }
 
-// FR04-3: เดือนแรกที่กระแสเงินสดสะสมมากกว่าหรือเท่ากับเงินลงทุนเริ่มต้น (null = ยังไม่คืนทุน)
-function findPaybackMonth(monthlyRows, initialBudget) {
-  for (const row of monthlyRows) {
-    if (row.cumulative >= initialBudget && initialBudget > 0) return row.period;
-  }
-  return null;
+async function loadAnalysisRows(projectId) {
+  const [rows] = await db.query(
+    `SELECT pl.phase, pl.period_index, pl.category_id, pl.total_value,
+            c.category_name, c.category_group, et.is_inflow
+     FROM project_ledger pl
+     LEFT JOIN categories c ON pl.category_id = c.category_id
+     LEFT JOIN entry_types et ON pl.type_id = et.type_id
+     WHERE pl.project_id = ?`,
+    [projectId]
+  );
+  return rows;
+}
+
+function analysisResponse(project, rows) {
+  return {
+    project: {
+      project_id: project.project_id,
+      project_name: project.project_name,
+      project_type: project.project_type,
+      calculation_method: project.calculation_method || 'MIXED',
+      project_status: project.project_status,
+      duration_months: Math.max(1, num(project.duration_months) || 12),
+      initial_budget: num(project.initial_budget),
+      target_roi_percent: project.target_roi_percent != null ? num(project.target_roi_percent) : null,
+    },
+    ...analyzeProject(project, rows),
+  };
 }
 
 exports.getProjectAnalytics = async (req, res) => {
   try {
-    const { id } = req.params;
-    const userId = req.user.userId;
-
-    // สิทธิ์การเข้าถึงเหมือน getProjectById — เจ้าของ หรือผู้ที่ถูกแชร์ให้ดู
-    const [[project]] = await db.query(
-      `SELECT p.project_id, p.project_name, p.duration_months, p.initial_budget,
-              p.target_roi_percent, p.user_id, p.created_at, pt.type_name AS project_type
-       FROM projects p
-       LEFT JOIN project_types pt ON p.project_type_id = pt.type_id
-       WHERE p.project_id = ?
-         AND (
-           p.user_id = ?
-           OR EXISTS(SELECT 1 FROM project_access pa WHERE pa.project_id = p.project_id AND pa.user_id = ?)
-           OR ${IS_PUBLIC_SQL}
-         )`,
-      [id, userId, userId]
-    );
-
-    if (!project) {
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
-    }
-
-    // รวมยอดรายรับ/รายจ่ายของแต่ละงวด แยกตาม phase
-    const [periodRows] = await db.query(
-      `SELECT pl.phase, pl.period_index,
-              SUM(CASE WHEN et.is_inflow = 1 THEN pl.total_value ELSE 0 END) AS revenue,
-              SUM(CASE WHEN et.is_inflow = 0 THEN pl.total_value ELSE 0 END) AS expense
-       FROM project_ledger pl
-       LEFT JOIN entry_types et ON pl.type_id = et.type_id
-       WHERE pl.project_id = ?
-       GROUP BY pl.phase, pl.period_index
-       ORDER BY pl.period_index ASC`,
-      [id]
-    );
-
-    const durationMonths = Math.max(1, num(project.duration_months) || 12);
-    const initialBudget = num(project.initial_budget);
-
-    // จำนวนงวดที่แสดง = ระยะเวลาโครงการ แต่ถ้ามีข้อมูลเลยไปกว่านั้น (เช่นแก้ระยะเวลาทีหลัง)
-    // ก็ต้องแสดงให้ครบ ไม่งั้นยอดรวมรายเดือนจะไม่ตรงกับยอดรวมทั้งโครงการ
-    const maxRecordedPeriod = periodRows.reduce((max, r) => Math.max(max, num(r.period_index)), 0);
-    const periodCount = Math.max(durationMonths, maxRecordedPeriod);
-
-    const bucket = (phase, period) =>
-      periodRows.find((r) => r.phase === phase && num(r.period_index) === period);
-
-    const monthly = [];
-    let estCumulative = 0;
-    let actCumulative = 0;
-    const estMonthlyForPayback = [];
-    const actMonthlyForPayback = [];
-    let hasActualData = false;
-
-    for (let period = 1; period <= periodCount; period++) {
-      const est = bucket('ESTIMATED', period);
-      const act = bucket('ACTUAL', period);
-
-      const estRevenue = num(est?.revenue);
-      const estExpense = num(est?.expense);
-      const estNcf = estRevenue - estExpense;
-      estCumulative += estNcf;
-
-      const actRevenue = num(act?.revenue);
-      const actExpense = num(act?.expense);
-      const actNcf = actRevenue - actExpense;
-      actCumulative += actNcf;
-
-      if (act) hasActualData = true;
-
-      estMonthlyForPayback.push({ period, cumulative: estCumulative });
-      actMonthlyForPayback.push({ period, cumulative: actCumulative });
-
-      monthly.push({
-        period,
-        estimated: { revenue: estRevenue, expense: estExpense, ncf: estNcf, cumulative: estCumulative },
-        actual: {
-          revenue: actRevenue,
-          expense: actExpense,
-          ncf: actNcf,
-          cumulative: actCumulative,
-          hasData: !!act
-        },
-        // FR05-2: ส่วนต่างรายเดือนและสะสม (จริง - คาดการณ์)
-        variance: {
-          revenue: actRevenue - estRevenue,
-          expense: actExpense - estExpense,
-          ncf: actNcf - estNcf,
-          cumulative: actCumulative - estCumulative
-        }
-      });
-    }
-
-    const totalEstRevenue = monthly.reduce((s, m) => s + m.estimated.revenue, 0);
-    const totalEstExpense = monthly.reduce((s, m) => s + m.estimated.expense, 0);
-    const totalActRevenue = monthly.reduce((s, m) => s + m.actual.revenue, 0);
-    const totalActExpense = monthly.reduce((s, m) => s + m.actual.expense, 0);
-
-    const estRoi = calcRoi(totalEstRevenue, totalEstExpense);
-    const actRoi = calcRoi(totalActRevenue, totalActExpense);
-
-    const targetRoi = project.target_roi_percent != null ? num(project.target_roi_percent) : null;
-
-    // FR04-4: เทียบกับ ROI จริงถ้ามีข้อมูล Actual แล้ว ถ้ายังไม่มีก็เทียบกับที่คาดการณ์ไว้
-    // (แจ้งด้วยว่าใช้ฐานไหนตัดสิน เพื่อไม่ให้เข้าใจผิดว่าเป็นผลจริงทั้งที่ยังไม่ได้บันทึก)
-    const worthwhileBasis = hasActualData ? 'actual' : 'estimated';
-    const roiForComparison = hasActualData ? actRoi : estRoi;
-    const isWorthwhile = targetRoi == null ? null : roiForComparison >= targetRoi;
-
-    // สรุปตามหมวดหมู่ — ใช้ทำกราฟแท่งเปรียบเทียบผลประโยชน์ (FR05-1)
-    const [categoryRows] = await db.query(
-      `SELECT pl.category_id, c.category_name, c.category_group, et.is_inflow,
-              SUM(CASE WHEN pl.phase = 'ESTIMATED' THEN pl.total_value ELSE 0 END) AS estimated,
-              SUM(CASE WHEN pl.phase = 'ACTUAL' THEN pl.total_value ELSE 0 END) AS actual
-       FROM project_ledger pl
-       LEFT JOIN categories c ON pl.category_id = c.category_id
-       LEFT JOIN entry_types et ON pl.type_id = et.type_id
-       WHERE pl.project_id = ?
-       GROUP BY pl.category_id, c.category_name, c.category_group, et.is_inflow
-       ORDER BY et.is_inflow DESC, pl.category_id ASC`,
-      [id]
-    );
-
-    const byCategory = categoryRows.map((r) => ({
-      category_id: r.category_id,
-      category_name: r.category_name,
-      category_group: r.category_group,
-      is_inflow: !!r.is_inflow,
-      estimated: num(r.estimated),
-      actual: num(r.actual),
-      variance: num(r.actual) - num(r.estimated)
-    }));
-
-    res.json({
-      status: 'success',
-      data: {
-        project: {
-          project_id: project.project_id,
-          project_name: project.project_name,
-          project_type: project.project_type,
-          duration_months: durationMonths,
-          initial_budget: initialBudget,
-          target_roi_percent: targetRoi
-        },
-        monthly,
-        summary: {
-          hasActualData,
-          estimated: {
-            totalRevenue: totalEstRevenue,
-            totalExpense: totalEstExpense,
-            netProfit: totalEstRevenue - totalEstExpense,
-            roi: estRoi,
-            paybackMonth: findPaybackMonth(estMonthlyForPayback, initialBudget)
-          },
-          actual: {
-            totalRevenue: totalActRevenue,
-            totalExpense: totalActExpense,
-            netProfit: totalActRevenue - totalActExpense,
-            roi: actRoi,
-            paybackMonth: findPaybackMonth(actMonthlyForPayback, initialBudget)
-          },
-          variance: {
-            revenue: totalActRevenue - totalEstRevenue,
-            expense: totalActExpense - totalEstExpense,
-            netProfit: (totalActRevenue - totalActExpense) - (totalEstRevenue - totalEstExpense),
-            roi: actRoi - estRoi
-          },
-          targetRoi,
-          roiForComparison,
-          worthwhileBasis,
-          isWorthwhile
-        },
-        byCategory
-      }
-    });
+    const project = await loadAnalysisProject(req.params.id, req.user.userId);
+    if (!project) return notFound(res);
+    const rows = await loadAnalysisRows(req.params.id);
+    res.json({ status: 'success', data: analysisResponse(project, rows) });
   } catch (error) {
     console.error('[Project] getProjectAnalytics Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to calculate project analytics' });
@@ -697,48 +533,55 @@ exports.getProjectAnalytics = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 6. POST /api/projects/:id/ledgers — บันทึก Ledger batch
+// 5.6. POST /api/projects/:id/analytics/preview — คำนวณผลจากรายการที่กำลังกรอก (ยังไม่บันทึก)
+// ให้ฟอร์มแสดง ROI/ระยะคืนทุนสดได้ด้วยสูตรเดียวกับรายงาน โดยไม่ต้องคำนวณซ้ำใน frontend
+// ══════════════════════════════════════════════════════════
+exports.previewProjectAnalytics = async (req, res) => {
+  try {
+    const { phase, ledgers } = req.body;
+    if (!PHASE_TO_DB[phase]) return badRequest(res, 'phase ต้องเป็น Estimated หรือ Actual');
+
+    const project = await loadAnalysisProject(req.params.id, req.user.userId);
+    if (!project || project.user_id !== req.user.userId) return notFound(res);
+
+    const categories = await loadCategoryMap(ledgers);
+    const { rows: draft, error } = expandLedgerItems(ledgers, categories, project);
+    if (error) return badRequest(res, error);
+
+    const dbPhase = PHASE_TO_DB[phase];
+    const saved = (await loadAnalysisRows(req.params.id)).filter((r) => r.phase !== dbPhase);
+    const draftRows = draft.map((r) => {
+      const c = categories.get(r.category_id);
+      return { ...r, phase: dbPhase, category_name: c.category_name, category_group: c.category_group, is_inflow: c.is_inflow };
+    });
+
+    res.json({ status: 'success', data: analysisResponse(project, [...saved, ...draftRows]) });
+  } catch (error) {
+    console.error('[Project] previewProjectAnalytics Error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to preview project analytics' });
+  }
+};
+
+// ══════════════════════════════════════════════════════════
+// 6. POST /api/projects/:id/ledgers — เพิ่มรายการ (ต่อท้ายของเดิม)
 // ══════════════════════════════════════════════════════════
 exports.saveLedgers = async (req, res) => {
   try {
-    const { id } = req.params;
-    // ledgers = array ของรายการ, phase = 'Estimated' หรือ 'Actual'
-    const { phase, ledgers } = req.body;
+    const { phase } = req.body;
+    if (!phase || !PHASE_TO_DB[phase]) return badRequest(res, 'phase ต้องเป็น Estimated หรือ Actual');
 
-    // เฉพาะเจ้าของโปรเจกต์เท่านั้นที่บันทึกข้อมูลได้ (ตรงกับ endpoint อัปเดต ledger อีก 2 ตัว)
-    if (!(await isProjectOwner(id, req.user.userId))) {
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
+    const prepared = await prepareLedgerWrite(req, res, { requireRows: true });
+    if (!prepared) return;
+
+    if (phase === 'Estimated' && (await hasActualData(req.params.id))) {
+      return badRequest(res, 'ไม่สามารถแก้ไข Estimated ได้ เนื่องจากมีข้อมูล Actual แล้ว');
     }
 
-    if (!ledgers || !Array.isArray(ledgers) || ledgers.length === 0) {
-      return res.status(400).json({ status: 'error', message: 'กรุณาระบุข้อมูล ledger' });
-    }
-
-    if (!phase || !['Estimated', 'Actual'].includes(phase)) {
-      return res.status(400).json({ status: 'error', message: 'phase ต้องเป็น Estimated หรือ Actual' });
-    }
-    const dbPhase = PHASE_TO_DB[phase];
-
-    const refError = await validateLedgerRefs(ledgers);
-    if (refError) {
-      return res.status(400).json({ status: 'error', message: refError });
-    }
-
-    const maxPeriod = await getProjectDuration(id);
-
-    // วันที่ default = วันนี้ (ถ้า frontend ไม่ส่งมา)
-    const today = new Date().toISOString().split('T')[0];
-
-    // Insert ทีละรายการในลูป (ledger_id เป็น AUTO_INCREMENT แล้ว)
-    for (const item of ledgers) {
-      await insertLedgerRow(id, dbPhase, item, today, req.user?.userId, maxPeriod);
-    }
-
+    await replaceLedgers(req.params.id, PHASE_TO_DB[phase], prepared.rows, req.user.userId, { append: true });
     res.status(201).json({
       status: 'success',
-      message: `บันทึก Ledger (${phase}) สำเร็จ ${ledgers.length} รายการ`
+      message: `บันทึก Ledger (${phase}) สำเร็จ ${prepared.rows.length} รายการ`,
     });
-
   } catch (error) {
     console.error('[Project] saveLedgers Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to save ledgers' });
@@ -748,40 +591,21 @@ exports.saveLedgers = async (req, res) => {
 // ══════════════════════════════════════════════════════════
 // 7. PATCH /api/projects/:id/visibility — สลับ Public/Private
 // ══════════════════════════════════════════════════════════
-// หมายเหตุ: schema v1.2 ไม่มีคอลัมน์ projects.is_public แล้ว — "สาธารณะ" ตอนนี้หมายถึงมีแถวใน
-// project_access ให้ user คนอื่นเป็น 'viewer' (ดูได้อย่างเดียว แก้ไขไม่ได้) แทน
 exports.toggleVisibility = async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.userId;
     const { is_public } = req.body;
 
-    // ตรวจ ownership
-    const [[project]] = await db.query(
-      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
-      [id, userId]
-    );
-    if (!project) {
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
-    }
+    const project = await getOwnedProject(id, userId);
+    if (!project) return notFound(res);
 
-    // กติกา: โปรเจกต์ที่ยังไม่มีข้อมูล Actual (สถานะ Estimated) ห้ามเปิดเป็นสาธารณะ
-    // เช็คฝั่ง server ด้วย ไม่พึ่ง frontend อย่างเดียว (ต่อให้ frontend ส่ง request มาผิดก็ตาม)
-    if (is_public) {
-      const [[{ hasActual }]] = await db.query(
-        "SELECT COUNT(*) AS hasActual FROM project_ledger WHERE project_id = ? AND phase = 'ACTUAL'",
-        [id]
-      );
-      if (hasActual === 0) {
-        return res.status(400).json({
-          status: 'error',
-          message: 'ต้องมีข้อมูล Actual ก่อน ถึงจะเปิดโปรเจกต์เป็นสาธารณะได้'
-        });
-      }
+    // โครงการที่ยังไม่มีข้อมูล Actual ห้ามเปิดเป็นสาธารณะ (เช็คฝั่ง server ด้วย)
+    if (is_public && !(await hasActualData(id))) {
+      return badRequest(res, 'ต้องมีข้อมูล Actual ก่อน ถึงจะเปิดโปรเจกต์เป็นสาธารณะได้');
     }
 
     if (is_public) {
-      // แชร์สิทธิ์ viewer ให้ user อื่นทุกคนในระบบ
       const [otherUsers] = await db.query('SELECT user_id FROM users WHERE user_id <> ?', [userId]);
       for (const u of otherUsers) {
         await db.query(
@@ -792,13 +616,12 @@ exports.toggleVisibility = async (req, res) => {
         );
       }
     } else {
-      // เอาสิทธิ์ของคนอื่น (ที่ไม่ใช่เจ้าของ) ออกทั้งหมด กลับไปเป็นส่วนตัว
       await db.query('DELETE FROM project_access WHERE project_id = ? AND user_id <> ?', [id, userId]);
     }
 
     res.json({
       status: 'success',
-      message: is_public ? 'เปลี่ยนสถานะเป็นสาธารณะแล้ว' : 'เปลี่ยนสถานะเป็นส่วนตัวแล้ว'
+      message: is_public ? 'เปลี่ยนสถานะเป็นสาธารณะแล้ว' : 'เปลี่ยนสถานะเป็นส่วนตัวแล้ว',
     });
   } catch (error) {
     console.error('[Project] toggleVisibility Error:', error);
@@ -807,51 +630,18 @@ exports.toggleVisibility = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 8. PUT /api/projects/:id/ledgers/estimated — อัปเดต Estimated Ledger
+// 8. PUT /api/projects/:id/ledgers/estimated — แทนที่ Estimated ทั้งหมด
 // ══════════════════════════════════════════════════════════
 exports.updateEstimatedLedgers = async (req, res) => {
   try {
-    const { id } = req.params;
-    const userId = req.user.userId;
-    const { ledgers } = req.body;
+    const prepared = await prepareLedgerWrite(req, res, { requireRows: false });
+    if (!prepared) return;
 
-    // ตรวจ ownership และยังไม่มี Actual
-    const [[project]] = await db.query(
-      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
-      [id, userId]
-    );
-    if (!project) {
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
+    if (await hasActualData(req.params.id)) {
+      return badRequest(res, 'ไม่สามารถแก้ไข Estimated ได้ เนื่องจากมีข้อมูล Actual แล้ว');
     }
 
-    // ตรวจว่ามี Actual แล้วหรือยัง (ถ้ามีแล้วห้ามแก้ Estimated)
-    const [[{ hasActual }]] = await db.query(
-      'SELECT COUNT(*) AS hasActual FROM project_ledger WHERE project_id = ? AND phase = "ACTUAL"',
-      [id]
-    );
-    if (hasActual > 0) {
-      return res.status(400).json({ status: 'error', message: 'ไม่สามารถแก้ไข Estimated ได้ เนื่องจากมีข้อมูล Actual แล้ว' });
-    }
-
-    if (ledgers && ledgers.length > 0) {
-      const refError = await validateLedgerRefs(ledgers);
-      if (refError) {
-        return res.status(400).json({ status: 'error', message: refError });
-      }
-    }
-
-    // ลบ Estimated เก่าทั้งหมดแล้ว insert ใหม่
-    await db.query('DELETE FROM project_ledger WHERE project_id = ? AND phase = "ESTIMATED"', [id]);
-
-    if (ledgers && ledgers.length > 0) {
-      const today = new Date().toISOString().split('T')[0];
-      const maxPeriod = await getProjectDuration(id);
-
-      for (const item of ledgers) {
-        await insertLedgerRow(id, 'ESTIMATED', item, today, userId, maxPeriod);
-      }
-    }
-
+    await replaceLedgers(req.params.id, 'ESTIMATED', prepared.rows, req.user.userId);
     res.json({ status: 'success', message: 'อัปเดต Estimated สำเร็จ' });
   } catch (error) {
     console.error('[Project] updateEstimatedLedgers Error:', error);
@@ -860,40 +650,14 @@ exports.updateEstimatedLedgers = async (req, res) => {
 };
 
 // ══════════════════════════════════════════════════════════
-// 9. PUT /api/projects/:id/ledgers/actual — อัปเดต Actual Ledger
+// 9. PUT /api/projects/:id/ledgers/actual — แทนที่ Actual ทั้งหมด
 // ══════════════════════════════════════════════════════════
 exports.updateActualLedgers = async (req, res) => {
   try {
-    const { id } = req.params;
-    const userId = req.user.userId;
-    const { ledgers } = req.body;
+    const prepared = await prepareLedgerWrite(req, res, { requireRows: false });
+    if (!prepared) return;
 
-    const [[project]] = await db.query(
-      'SELECT project_id FROM projects WHERE project_id = ? AND user_id = ?',
-      [id, userId]
-    );
-    if (!project) {
-      return res.status(404).json({ status: 'error', message: 'Project not found' });
-    }
-
-    if (ledgers && ledgers.length > 0) {
-      const refError = await validateLedgerRefs(ledgers);
-      if (refError) {
-        return res.status(400).json({ status: 'error', message: refError });
-      }
-    }
-
-    await db.query('DELETE FROM project_ledger WHERE project_id = ? AND phase = "ACTUAL"', [id]);
-
-    if (ledgers && ledgers.length > 0) {
-      const today = new Date().toISOString().split('T')[0];
-      const maxPeriod = await getProjectDuration(id);
-
-      for (const item of ledgers) {
-        await insertLedgerRow(id, 'ACTUAL', item, today, userId, maxPeriod);
-      }
-    }
-
+    await replaceLedgers(req.params.id, 'ACTUAL', prepared.rows, req.user.userId);
     res.json({ status: 'success', message: 'อัปเดต Actual สำเร็จ' });
   } catch (error) {
     console.error('[Project] updateActualLedgers Error:', error);

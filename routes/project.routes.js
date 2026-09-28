@@ -15,6 +15,8 @@ router.post('/:id/ledgers', verifyProjectWriter, projectController.saveLedgers);
 
 // ผลการคำนวณทั้งหมดของโครงการ (NCF, กระแสเงินสดสะสม, ROI, ระยะคืนทุน, ส่วนต่าง)
 router.get('/:id/analytics', verifyToken, projectController.getProjectAnalytics);
+// พรีวิวผลการคำนวณจากรายการที่กำลังกรอกในฟอร์ม (ไม่บันทึกลงฐานข้อมูล)
+router.post('/:id/analytics/preview', verifyProjectWriter, projectController.previewProjectAnalytics);
 
 // อัปเดต Estimated Ledger (ใช้เมื่อแก้ไขหลังบันทึกแล้ว)
 router.put('/:id/ledgers/estimated', verifyProjectWriter, projectController.updateEstimatedLedgers);

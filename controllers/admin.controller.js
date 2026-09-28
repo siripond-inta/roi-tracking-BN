@@ -16,6 +16,8 @@ exports.getAllProjects = async (req, res) => {
         p.duration_months,
         p.initial_budget,
         p.created_at,
+        p.status AS project_status,
+        pt.calculation_method,
         EXISTS(
           SELECT 1 FROM project_access pa
           WHERE pa.project_id = p.project_id AND pa.user_id <> p.user_id AND pa.permission_level = 'viewer'
