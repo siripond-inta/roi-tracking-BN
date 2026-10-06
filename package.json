@@ -7,14 +7,18 @@
   "type": "commonjs",
   "main": "index.js",
   "scripts": {
-    "test": "node --test \"tests/**/*.test.js\"",
+    "test": "jest",
     "start": "node server.js",
     "dev": "nodemon server.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "db:seed": "node db/seed.js"
+    "db:seed": "node db/seed.js",
+    "test:unit": "jest --selectProjects unit",
+    "test:api": "jest --selectProjects api",
+    "test:report": "jest --coverage",
+    "test:postman": "newman run postman/roi-tracking.postman_collection.json -r cli,htmlextra --reporter-htmlextra-export test-reports/postman/newman-report.html --reporter-htmlextra-title \"ROI Tracking — API Test Report (Postman/Newman)\""
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -27,6 +31,11 @@
   },
   "devDependencies": {
     "drizzle-kit": "^0.31.10",
-    "nodemon": "^3.1.14"
+    "jest": "^29.7.0",
+    "jest-html-reporters": "^3.1.7",
+    "newman": "^6.2.2",
+    "newman-reporter-htmlextra": "^1.23.1",
+    "nodemon": "^3.1.14",
+    "supertest": "^7.3.1"
   }
 }

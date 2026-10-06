@@ -42,8 +42,13 @@ app.use('/api/categories', categoryRoutes);
 app.use('/api/project-types', projectTypeRoutes);
 
 
-// ตั้งค่า Port และ Start Server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}.`);
-});
+// export app ให้ integration test (Supertest) เรียกใช้ได้โดยไม่ต้องเปิด port จริง
+module.exports = app;
+
+// ตั้งค่า Port และ Start Server — เฉพาะตอนรันไฟล์นี้ตรงๆ (node server.js / nodemon) ไม่ใช่ตอนถูก require
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}.`);
+  });
+}

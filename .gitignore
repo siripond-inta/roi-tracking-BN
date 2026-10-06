@@ -3,3 +3,6 @@ npm-debug.log
 .env
 .DS_Store
 Thumbs.db
+
+# ผลการทดสอบที่สร้างใหม่ทุกครั้งที่รัน (npm run test:report / test:postman)
+test-reports/

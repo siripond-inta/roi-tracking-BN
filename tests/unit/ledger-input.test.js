@@ -1,6 +1,5 @@
-const test = require('node:test');
 const assert = require('node:assert/strict');
-const { expandLedgerItems, periodDate } = require('../services/ledger-input');
+const { expandLedgerItems, periodDate } = require('../../services/ledger-input');
 
 const categories = new Map([
   ['REV001', { type_id: 2, category_name: 'รายได้จากการขาย', unit_label: null, rate_label: null }],
@@ -54,4 +53,13 @@ test('หมวดหมู่ที่ไม่มีจริงถูกป�
 test('วันที่ของงวดนับจากเดือนเริ่มโครงการ', () => {
   assert.equal(periodDate('2026-01-10T00:00:00Z', 1), '2026-01-15');
   assert.equal(periodDate('2026-11-10T00:00:00Z', 3), '2027-01-15');
+});
+
+test('หมวด "อื่นๆ" ต้องระบุชื่อรายการ และเก็บชื่อที่ตัดช่องว่างแล้ว', () => {
+  const cats = new Map([['OPCOTH', { type_id: 1, category_name: 'อื่นๆ', unit_label: null, rate_label: null, allow_custom_name: 1 }]]);
+  const project = { duration_months: 6, created_at: '2026-01-10' };
+  assert.match(expandLedgerItems([{ category_id: 'OPCOTH', total_value: 100 }], cats, project).error, /ระบุชื่อรายการ/);
+  const { rows } = expandLedgerItems([{ category_id: 'OPCOTH', total_value: 100, custom_name: '  ค่าโฆษณา ', period_from: 1, period_to: 2 }], cats, project);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].custom_name, 'ค่าโฆษณา');
 });

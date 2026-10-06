@@ -1,7 +1,6 @@
 // tests/finance.test.js — รันด้วย `npm test` (node --test ไม่ต้องลง library เพิ่ม)
-const test = require('node:test');
 const assert = require('node:assert/strict');
-const { analyzeProject, calcRoi, findPaybackMonth, isCounted, summarizeForList } = require('../services/finance');
+const { analyzeProject, calcRoi, calcPaybackMonths, isCounted, summarizeForList } = require('../../services/finance');
 
 const row = (phase, period, category_group, total_value, extra = {}) => ({
   phase,
@@ -16,7 +15,7 @@ const row = (phase, period, category_group, total_value, extra = {}) => ({
 test('ROI = (ผลประโยชน์ - ต้นทุน) / ต้นทุน × 100 และไม่หารด้วยศูนย์', () => {
   assert.equal(calcRoi(150, 100), 50);
   assert.equal(calcRoi(50, 100), -50);
-  assert.equal(calcRoi(100, 0), 0);
+  assert.equal(calcRoi(100, 0), null); // ไม่มีต้นทุน → คำนวณ ROI ไม่ได้ (เดิมคืน 0)
 });
 
 test('ประเภทโครงการเลือกแหล่งผลประโยชน์ที่นับ', () => {
@@ -64,25 +63,36 @@ test('กระแสเงินสดรายเดือนและสะ�
   assert.deepEqual(monthly.map((m) => m.estimated.cumulative), [-320, -140, 10]);
 });
 
-test('คืนทุน = เดือนแรกที่กระแสเงินสดสะสมกลับมาไม่ติดลบ', () => {
-  const list = [
-    { period: 1, expense: 300, cumulative: -300 },
-    { period: 2, expense: 0, cumulative: -100 },
-    { period: 3, expense: 0, cumulative: 50 },
-  ];
-  assert.equal(findPaybackMonth(list), 3);
-  // เดือนที่ยังไม่มีต้นทุนเลยไม่นับว่าคืนทุน (สะสม 0 เพราะยังไม่มีอะไรเกิดขึ้น)
-  assert.equal(findPaybackMonth([{ period: 1, expense: 0, cumulative: 0 }]), null);
-  assert.equal(findPaybackMonth([{ period: 1, expense: 100, cumulative: -100 }]), null);
+test('ระยะคืนทุน = ต้นทุนรวม ÷ (ผลประโยชน์รวม ÷ จำนวนเดือน)', () => {
+  // ตัวอย่างโครงการ CRM: 661,000 ÷ (1,086,000 ÷ 12) = 7.30 เดือน
+  assert.equal(calcPaybackMonths(661000, 1086000, 12).toFixed(1), '7.3');
+  // ผลประโยชน์น้อยกว่าต้นทุนมาก → นานกว่าระยะเวลาโครงการได้
+  assert.equal(calcPaybackMonths(120000, 60000, 12), 24);
+  // ไม่มีผลประโยชน์ หรือไม่มีต้นทุน → คำนวณไม่ได้
+  assert.equal(calcPaybackMonths(100000, 0, 12), null);
+  assert.equal(calcPaybackMonths(0, 50000, 12), null);
 });
 
-test('ROI กับระยะคืนทุนใช้ต้นทุนชุดเดียวกัน — ROI บวกต้องคืนทุนแล้ว', () => {
-  const { summary } = analyzeProject({ duration_months: 2, initial_budget: 300000 }, [
-    row('ESTIMATED', 1, 'INV', 50000),
-    row('ESTIMATED', 2, 'REV', 100000),
-  ]);
+test('ระยะคืนทุนใช้ต้นทุน/ผลประโยชน์ชุดเดียวกับ ROI และนับจำนวนเดือนตามช่วงข้อมูล', () => {
+  const rows = [
+    row('ESTIMATED', 1, 'INV', 60000),
+    row('ESTIMATED', 2, 'REV', 40000),
+    row('ESTIMATED', 3, 'REV', 40000),
+    row('ESTIMATED', 4, 'REV', 40000),
+    // ผลจริงมีแค่ 2 เดือน → ผลประโยชน์เฉลี่ยต่อเดือนคิดจาก 2 เดือน
+    row('ACTUAL', 1, 'INV', 60000),
+    row('ACTUAL', 2, 'REV', 30000),
+  ];
+  const { summary } = analyzeProject({ duration_months: 4, calculation_method: 'REVENUE' }, rows);
   assert.equal(summary.estimated.roi, 100);
-  assert.equal(summary.estimated.paybackMonth, 2);
+  assert.equal(summary.estimated.paybackMonths, 60000 / (120000 / 4)); // 2 เดือน
+  assert.equal(summary.actual.paybackMonths, 60000 / (30000 / 2));     // 4 เดือน
+  const list = summarizeForList({ duration_months: 4, calculation_method: 'REVENUE' }, rows);
+  assert.equal(list.estimated_payback_months, 2);
+  assert.equal(list.actual_payback_months, 4);
+  // แผนช่วงเดียวกัน (เดือน 1–2): 60,000 ÷ (40,000 ÷ 2) = 3 เดือน
+  assert.equal(summary.estimatedToDate.paybackMonths, 3);
+  assert.equal(list.estimated_to_date_payback_months, 3);
 });
 
 test('ประโยชน์ทางอ้อมเทียบเป็นรายปีจากค่าเฉลี่ยรายเดือน', () => {
@@ -128,4 +138,30 @@ test('byCategory เทียบผลจริงกับแผนถึงเ
   assert.equal(c.estimatedToDate, 200);
   assert.equal(c.varianceToDate, 10);
   assert.equal(c.estimatedByPeriod, undefined);
+});
+
+test('แผนถึงเดือนเดียวกัน และหมวด "อื่นๆ" แยกตามชื่อที่ผู้ใช้ระบุ', () => {
+  const row = (phase, period, cat, group, value, custom) => ({
+    phase, period_index: period, category_id: cat, category_group: group, is_inflow: group === 'REV' ? 1 : 0,
+    total_value: value, custom_name: custom, category_name: 'อื่นๆ',
+  });
+  const rows = [
+    row('ESTIMATED', 1, 'OPCOTH', 'OPC', 100, 'ค่าโฆษณา'),
+    row('ESTIMATED', 1, 'OPCOTH', 'OPC', 50, 'ค่าขนส่ง'),
+    row('ESTIMATED', 1, 'REV001', 'REV', 300),
+    row('ESTIMATED', 2, 'REV001', 'REV', 300),
+    row('ACTUAL', 1, 'REV001', 'REV', 200),
+    row('ACTUAL', 1, 'OPCOTH', 'OPC', 100, 'ค่าโฆษณา'),
+  ];
+  const { summary, byCategory } = analyzeProject({ duration_months: 2, calculation_method: 'REVENUE' }, rows);
+  assert.deepEqual(byCategory.filter((c) => c.category_id === 'OPCOTH').map((c) => c.category_name).sort(), ['ค่าขนส่ง', 'ค่าโฆษณา']);
+  assert.equal(summary.estimatedToDate.months, 1);
+  assert.equal(summary.estimatedToDate.totalRevenue, 300);
+  assert.equal(summary.estimatedToDate.totalExpense, 150);
+  assert.equal(summary.estimatedToDate.roi, 100);
+
+  const list = summarizeForList({ duration_months: 2, calculation_method: 'REVENUE' }, rows);
+  assert.equal(list.has_actual, true);
+  assert.equal(list.actual_roi, 100);
+  assert.equal(list.estimated_roi, calcRoi(600, 150));
 });
