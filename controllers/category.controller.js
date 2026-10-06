@@ -13,8 +13,9 @@ const INFLOW_GROUPS = ['REV', 'BEN'];
 
 async function generateCategoryId(prefix) {
   const [rows] = await db.query(
-    'SELECT category_id FROM categories WHERE category_id LIKE ? ORDER BY LENGTH(category_id) DESC, category_id DESC LIMIT 1',
-    [`${prefix}%`]
+    // นับเฉพาะรหัสที่ลงท้ายด้วยตัวเลข — ข้ามรหัสพิเศษอย่าง REVOTH ของหมวด "อื่นๆ"
+    'SELECT category_id FROM categories WHERE category_id REGEXP ? ORDER BY LENGTH(category_id) DESC, category_id DESC LIMIT 1',
+    [`^${prefix}[0-9]+$`]
   );
   let nextNum = 1;
   if (rows.length > 0) {
@@ -50,7 +51,7 @@ exports.getAll = async (req, res) => {
     const [rows] = await db.query(`
       SELECT
         c.category_id, c.category_name, c.type_id, c.category_group,
-        c.unit_label, c.rate_label,
+        c.unit_label, c.rate_label, c.allow_custom_name,
         et.type_name, et.is_inflow,
         (SELECT COUNT(*) FROM project_ledger pl WHERE pl.category_id = c.category_id) AS usage_count
       FROM categories c
@@ -82,7 +83,7 @@ exports.getEntryTypes = async (req, res) => {
 // ══════════════════════════════════════════════════════════
 exports.create = async (req, res) => {
   try {
-    const { category_name, category_group, unit_label, rate_label } = req.body;
+    const { category_name, category_group, unit_label, rate_label, allow_custom_name } = req.body;
 
     if (!category_name || !String(category_name).trim() || !category_group) {
       return res.status(400).json({ status: 'error', message: 'กรุณากรอกข้อมูลให้ครบ' });
@@ -102,9 +103,9 @@ exports.create = async (req, res) => {
       const category_id = await generateCategoryId(category_group);
       try {
         await db.query(
-          `INSERT INTO categories (category_id, category_name, type_id, category_group, unit_label, rate_label)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [category_id, String(category_name).trim(), typeId, category_group, unit_label || null, rate_label || null]
+          `INSERT INTO categories (category_id, category_name, type_id, category_group, unit_label, rate_label, allow_custom_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [category_id, String(category_name).trim(), typeId, category_group, unit_label || null, rate_label || null, !!allow_custom_name]
         );
         return res.status(201).json({ status: 'success', message: 'เพิ่มหมวดหมู่สำเร็จ', data: { category_id } });
       } catch (error) {
@@ -128,10 +129,20 @@ exports.create = async (req, res) => {
 exports.update = async (req, res) => {
   try {
     const { id } = req.params;
-    const { category_name, category_group, unit_label, rate_label } = req.body;
+    const { category_name, category_group, unit_label, rate_label, allow_custom_name } = req.body;
 
-    const [[existing]] = await db.query('SELECT category_group FROM categories WHERE category_id = ?', [id]);
+    const [[existing]] = await db.query(
+      'SELECT category_group, unit_label, rate_label FROM categories WHERE category_id = ?',
+      [id]
+    );
     if (!existing) return res.status(404).json({ status: 'error', message: 'ไม่พบหมวดหมู่นี้' });
+    if (category_name !== undefined && !String(category_name ?? '').trim()) {
+      return res.status(400).json({ status: 'error', message: 'กรุณากรอกชื่อหมวดหมู่' });
+    }
+
+    // ไม่ได้ส่งชื่อหน่วยมา (undefined) = คงค่าเดิม, ส่ง null/ว่าง = ล้างค่า
+    const nextUnit = unit_label === undefined ? existing.unit_label : unit_label || null;
+    const nextRate = rate_label === undefined ? existing.rate_label : rate_label || null;
 
     const group = category_group || existing.category_group;
     if (!VALID_GROUPS.includes(group)) {
@@ -150,7 +161,7 @@ exports.update = async (req, res) => {
       }
     }
 
-    const labelError = validateLabels(group, unit_label, rate_label);
+    const labelError = validateLabels(group, nextUnit, nextRate);
     if (labelError) return res.status(400).json({ status: 'error', message: labelError });
 
     const typeId = await entryTypeForGroup(group);
@@ -161,9 +172,13 @@ exports.update = async (req, res) => {
         category_group = ?,
         type_id = ?,
         unit_label = ?,
-        rate_label = ?
+        rate_label = ?,
+        allow_custom_name = COALESCE(?, allow_custom_name)
        WHERE category_id = ?`,
-      [category_name ? String(category_name).trim() : null, group, typeId, unit_label || null, rate_label || null, id]
+      [
+        category_name ? String(category_name).trim() : null, group, typeId, nextUnit, nextRate,
+        allow_custom_name === undefined ? null : !!allow_custom_name, id,
+      ]
     );
 
     res.json({ status: 'success', message: 'แก้ไขหมวดหมู่สำเร็จ' });

@@ -8,6 +8,10 @@
 // ทั้งสองแบบถูกเก็บเป็นหนึ่งแถวต่อหนึ่งเดือน รายงานรายเดือน/กราฟ/ระยะคืนทุนจึงคำนวณได้ตรงเดือน
 
 const MAX_ITEMS = 500;
+// เพดานตามความจุคอลัมน์ใน database — เกินนี้ MySQL จะปฏิเสธแล้ว API ตอบ 500 แทนที่จะบอกผู้ใช้
+//   total_value / amount_base / unit_cost = DECIMAL(15,2), unit_qty = DECIMAL(10,2)
+const MAX_AMOUNT = 9999999999999.99;
+const MAX_QTY = 99999999.99;
 
 const isNonNegativeNumber = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 
@@ -26,7 +30,7 @@ function periodDate(projectCreatedAt, period) {
 
 /**
  * @param items       รายการจากฟอร์ม
- * @param categories  Map<category_id, { type_id, unit_label, rate_label, category_name }>
+ * @param categories  Map<category_id, { type_id, unit_label, rate_label, category_name, allow_custom_name }>
  * @param project     { duration_months, created_at }
  * @returns { rows } หรือ { error }
  */
@@ -47,9 +51,12 @@ function expandLedgerItems(items, categories, project) {
     const cost = toNumberOrNull(item.unit_cost);
     const amount = toNumberOrNull(item.total_value);
 
-    for (const [name, v] of [['ปริมาณ', qty], ['อัตราต่อหน่วย', cost], ['จำนวนเงิน', amount]]) {
+    for (const [name, v, max] of [['ปริมาณ', qty, MAX_QTY], ['อัตราต่อหน่วย', cost, MAX_AMOUNT], ['จำนวนเงิน', amount, MAX_AMOUNT]]) {
       if (v !== null && !isNonNegativeNumber(v)) {
         return { error: `${label} (${category.category_name}): ${name}ต้องเป็นตัวเลขที่ไม่ติดลบ` };
+      }
+      if (v !== null && v > max) {
+        return { error: `${label} (${category.category_name}): ${name}สูงเกินไป (ไม่เกิน ${max.toLocaleString('en-US')})` };
       }
     }
 
@@ -60,8 +67,19 @@ function expandLedgerItems(items, categories, project) {
         return { error: `${label} (${category.category_name}): ต้องกรอกทั้ง "${category.unit_label}" และ "${category.rate_label}"` };
       }
       value = qty * cost;
+      if (value > MAX_AMOUNT) {
+        return { error: `${label} (${category.category_name}): มูลค่า (ปริมาณ × อัตรา) สูงเกินไป` };
+      }
     } else {
       value = amount ?? 0;
+    }
+
+    // หมวด "อื่นๆ" ต้องมีชื่อรายการที่ผู้ใช้พิมพ์เอง ส่วนหมวดปกติไม่เก็บชื่อนี้
+    let customName = null;
+    if (Number(category.allow_custom_name)) {
+      customName = typeof item.custom_name === 'string' ? item.custom_name.trim() : '';
+      if (!customName) return { error: `${label} (${category.category_name}): กรุณาระบุชื่อรายการ` };
+      if (customName.length > 255) return { error: `${label}: ชื่อรายการยาวเกิน 255 ตัวอักษร` };
     }
 
     const from = Number(item.period_from ?? item.period_index ?? 1);
@@ -77,6 +95,7 @@ function expandLedgerItems(items, categories, project) {
         // ไม่ตรงกับหมวด ซึ่งจะทำให้รายรับถูกนับเป็นรายจ่าย (หรือกลับกัน)
         type_id: category.type_id,
         category_id: item.category_id,
+        custom_name: customName,
         unit_qty: qtyBased && qty !== null ? qty : null,
         unit_cost: qtyBased && cost !== null ? cost : null,
         total_value: value,
@@ -89,4 +108,4 @@ function expandLedgerItems(items, categories, project) {
   return { rows };
 }
 
-module.exports = { expandLedgerItems, periodDate, MAX_ITEMS };
+module.exports = { expandLedgerItems, periodDate, MAX_ITEMS, MAX_AMOUNT, MAX_QTY };

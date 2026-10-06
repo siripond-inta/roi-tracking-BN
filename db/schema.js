@@ -67,6 +67,8 @@ const categories = mysqlTable('categories', {
   // null = หมวดหมู่ปกติที่กรอกยอดเงินตรงๆ ไม่ใช่แบบ qty × rate
   unitLabel: varchar('unit_label', { length: 100 }),
   rateLabel: varchar('rate_label', { length: 100 }),
+  // หมวด "อื่นๆ" — ผู้ใช้ต้องพิมพ์ชื่อรายการเอง (เก็บใน project_ledger.custom_name)
+  allowCustomName: boolean('allow_custom_name').notNull().default(false),
 });
 
 // ── projects ──────────────────────────────────────────────
@@ -119,6 +121,8 @@ const projectLedger = mysqlTable(
     unitCost: decimal('unit_cost', { precision: 15, scale: 2 }),
     totalValue: decimal('total_value', { precision: 15, scale: 2 }),
     transactionDate: date('transaction_date').notNull(),
+    // ชื่อรายการที่ผู้ใช้พิมพ์เองเมื่อเลือกหมวด "อื่นๆ" (categories.allow_custom_name)
+    customName: varchar('custom_name', { length: 255 }),
     note: text('note'),
     createdBy: int('created_by').references(() => users.userId),
     createdAt: timestamp('created_at').defaultNow(),

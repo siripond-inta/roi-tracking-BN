@@ -101,6 +101,15 @@ async function seedCategories() {
     { categoryId: 'OPC002', categoryName: 'ค่าบุคลากรดำเนินงาน', typeId: 1, categoryGroup: 'OPC' },
     { categoryId: 'ADC001', categoryName: 'ค่าบริหารจัดการโครงการ', typeId: 1, categoryGroup: 'ADC' },
     { categoryId: 'ADC002', categoryName: 'ค่าฝึกอบรมผู้ใช้งาน', typeId: 1, categoryGroup: 'ADC' },
+    // หมวด "อื่นๆ" ของแต่ละกลุ่ม — ผู้ใช้พิมพ์ชื่อรายการเอง (เหมือน migration 0004)
+    { categoryId: 'REVOTH', categoryName: 'รายได้อื่นๆ (ระบุเอง)', typeId: 2, categoryGroup: 'REV', allowCustomName: true },
+    {
+      categoryId: 'BENOTH', categoryName: 'ผลประโยชน์ทางอ้อมอื่นๆ (ระบุเอง)', typeId: 2, categoryGroup: 'BEN',
+      unitLabel: 'ปริมาณที่ลดได้ต่อเดือน', rateLabel: 'มูลค่าต่อหน่วย (บาท)', allowCustomName: true,
+    },
+    { categoryId: 'INVOTH', categoryName: 'เงินลงทุนอื่นๆ (ระบุเอง)', typeId: 1, categoryGroup: 'INV', allowCustomName: true },
+    { categoryId: 'OPCOTH', categoryName: 'ต้นทุนดำเนินงานอื่นๆ (ระบุเอง)', typeId: 1, categoryGroup: 'OPC', allowCustomName: true },
+    { categoryId: 'ADCOTH', categoryName: 'ค่าใช้จ่ายบริหารอื่นๆ (ระบุเอง)', typeId: 1, categoryGroup: 'ADC', allowCustomName: true },
   ]);
 }
 
@@ -159,6 +168,7 @@ const PLANS = {
       { cat: 'ADC001', from: 1, to: 12, amount: 6000, note: 'ค่าบริหารโครงการ' },
       { cat: 'REV001', from: 2, to: 12, amount: 115000, note: 'ยอดขายออนไลน์ที่เพิ่มขึ้น' },
       { cat: 'REV002', from: 4, to: 12, amount: 18000, note: 'ค่าสมาชิกรายเดือน' },
+      { cat: 'OPCOTH', customName: 'ค่าโฆษณาออนไลน์', from: 2, to: 12, amount: 8000, note: 'Facebook / Google Ads' },
     ],
   },
   [TYPE.COST_SAVING]: {
@@ -188,6 +198,7 @@ const PLANS = {
       { cat: 'REV002', from: 3, to: 12, amount: 12000, note: 'ค่าบริการรายเดือน' },
       { cat: 'BEN001', from: 2, to: 12, qty: 60, rate: 300, note: 'ลดเวลาตอบคำถามลูกค้า' },
       { cat: 'BEN004', from: 3, to: 12, qty: 6, rate: 1800, note: 'ลดการสั่งซื้อผิดพลาด' },
+      { cat: 'BENOTH', customName: 'ลดค่าโทรศัพท์ติดต่อลูกค้า', from: 2, to: 12, qty: 40, rate: 25, note: 'ใช้แชตแทนโทร' },
     ],
   },
 };
@@ -269,6 +280,7 @@ function ledgerRow(project, phase, period, catId, value, extra = {}) {
     amountBase: String(value),
     totalValue: String(value),
     transactionDate: periodDate(project.createdAt, period),
+    customName: extra.customName || null,
     note: extra.note || '',
     createdBy: project.owner.userId,
   };
@@ -284,9 +296,9 @@ function buildLedger(project, salt) {
       // แผน: ค่าเท่ากันทุกเดือนในช่วง
       if (item.qty != null) {
         rows.push(ledgerRow(project, 'ESTIMATED', period, item.cat, item.qty * item.rate,
-          { qty: item.qty, rate: item.rate, note: item.note }));
+          { qty: item.qty, rate: item.rate, note: item.note, customName: item.customName }));
       } else {
-        rows.push(ledgerRow(project, 'ESTIMATED', period, item.cat, item.amount, { note: item.note }));
+        rows.push(ledgerRow(project, 'ESTIMATED', period, item.cat, item.amount, { note: item.note, customName: item.customName }));
       }
 
       // ผลจริง: เฉพาะเดือนที่ผ่านมาแล้ว — ผลประโยชน์ปรับตาม actualFactor, ต้นทุนเกินแผนเล็กน้อย
@@ -296,10 +308,10 @@ function buildLedger(project, salt) {
       if (item.qty != null) {
         const qty = Math.max(0, Math.round(item.qty * factor));
         rows.push(ledgerRow(project, 'ACTUAL', period, item.cat, qty * item.rate,
-          { qty, rate: item.rate, note: `${item.note} (ผลจริง)` }));
+          { qty, rate: item.rate, note: item.note, customName: item.customName }));
       } else {
         const amount = Math.round((item.amount * factor) / 100) * 100;
-        rows.push(ledgerRow(project, 'ACTUAL', period, item.cat, amount, { note: `${item.note} (ผลจริง)` }));
+        rows.push(ledgerRow(project, 'ACTUAL', period, item.cat, amount, { note: item.note, customName: item.customName }));
       }
     }
   }
