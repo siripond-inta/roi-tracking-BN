@@ -10,6 +10,8 @@ const { expandLedgerItems } = require('../services/ledger-input');
 const MAX_DURATION_MONTHS = 120;
 // target_roi_percent เป็น DECIMAL(5,2) เก็บได้ไม่เกิน 999.99
 const MAX_TARGET_ROI = 999.99;
+// initial_budget เป็น DECIMAL(15,2)
+const MAX_BUDGET = 9999999999999.99;
 
 // Schema เก็บ phase เป็น 'ESTIMATED'/'ACTUAL' แต่ API/frontend ใช้ 'Estimated'/'Actual'
 const PHASE_TO_DB = { Estimated: 'ESTIMATED', Actual: 'ACTUAL' };
@@ -17,16 +19,16 @@ const PHASE_FROM_DB = { ESTIMATED: 'Estimated', ACTUAL: 'Actual' };
 const mapLedgerPhase = (row) => ({ ...row, phase: PHASE_FROM_DB[row.phase] || row.phase });
 
 // สถานะโครงการที่ผู้ใช้ตั้งได้ (Should-Have: Project Status Management)
-//   planning    กำลังวางแผน — กรอกประมาณการ
-//   in_progress กำลังดำเนินการ — บันทึกผลจริงได้ (ระบบตั้งให้เองเมื่อบันทึกผลจริงครั้งแรก)
-//   completed   สิ้นสุดโครงการแล้ว — ล็อกข้อมูลไม่ให้แก้ จนกว่าจะเปลี่ยนสถานะกลับ
+//   planning    "Estimated" — กรอกประมาณการ
+//   in_progress "Actual"    — บันทึกผลจริงได้ (ระบบตั้งให้เองเมื่อบันทึกผลจริงครั้งแรก)
+//   completed   "Completed" — ล็อกข้อมูลไม่ให้แก้ จนกว่าจะเปลี่ยนสถานะกลับ
 const EDITABLE_STATUSES = ['planning', 'in_progress', 'completed'];
 const LOCKED_STATUSES = ['completed', 'archived'];
 
 const LEDGER_SELECT_COLUMNS = `
   pl.ledger_id, pl.project_id, pl.phase, pl.period_index, pl.type_id, pl.category_id,
-  pl.unit_qty, pl.unit_cost, pl.total_value, pl.note, pl.transaction_date, pl.created_at,
-  c.category_name, c.category_group, c.unit_label, c.rate_label,
+  pl.unit_qty, pl.unit_cost, pl.total_value, pl.custom_name, pl.note, pl.transaction_date, pl.created_at,
+  c.category_name, c.category_group, c.unit_label, c.rate_label, c.allow_custom_name,
   et.type_name, et.is_inflow
 `;
 
@@ -72,7 +74,7 @@ function notFound(res) {
 
 async function getOwnedProject(projectId, userId) {
   const [[row]] = await db.query(
-    `SELECT p.project_id, p.duration_months, p.created_at, p.status
+    `SELECT p.project_id, p.duration_months, p.created_at, p.status, p.project_type_id, p.target_roi_percent
      FROM projects p WHERE p.project_id = ? AND p.user_id = ?`,
     [projectId, userId]
   );
@@ -91,7 +93,8 @@ async function loadCategoryMap(items) {
   const ids = [...new Set((items || []).map((i) => i && i.category_id).filter(Boolean))];
   if (ids.length === 0) return new Map();
   const [rows] = await db.query(
-    `SELECT c.category_id, c.category_name, c.type_id, c.category_group, c.unit_label, c.rate_label, et.is_inflow
+    `SELECT c.category_id, c.category_name, c.type_id, c.category_group, c.unit_label, c.rate_label,
+            c.allow_custom_name, et.is_inflow
      FROM categories c LEFT JOIN entry_types et ON c.type_id = et.type_id
      WHERE c.category_id IN (?)`,
     [ids]
@@ -114,6 +117,7 @@ function validateProjectFields({ project_name, duration_months, initial_budget, 
   if (isCreate || initial_budget !== undefined) {
     const b = Number(initial_budget);
     if (!Number.isFinite(b) || b <= 0) return 'งบลงทุนเริ่มต้นต้องมากกว่า 0';
+    if (b > MAX_BUDGET) return 'งบลงทุนเริ่มต้นสูงเกินไป';
   }
   if (target_roi_percent !== undefined && target_roi_percent !== null && target_roi_percent !== '') {
     const t = Number(target_roi_percent);
@@ -129,26 +133,33 @@ async function insertLedgerRows(conn, projectId, dbPhase, rows, createdBy) {
   await conn.query(
     `INSERT INTO project_ledger
        (project_id, phase, period_index, type_id, category_id,
-        unit_qty, unit_cost, amount_base, total_value, transaction_date, note, created_by)
+        unit_qty, unit_cost, amount_base, total_value, transaction_date, custom_name, note, created_by)
      VALUES ?`,
     [
       rows.map((r) => [
         projectId, dbPhase, r.period_index, r.type_id, r.category_id,
-        r.unit_qty, r.unit_cost, r.total_value, r.total_value, r.transaction_date, r.note, createdBy || null,
+        r.unit_qty, r.unit_cost, r.total_value, r.total_value, r.transaction_date, r.custom_name || null, r.note,
+        createdBy || null,
       ]),
     ]
   );
 }
 
 // ปรับสถานะให้สอดคล้องกับข้อมูลหลังบันทึกผลจริง: บันทึกผลจริงครั้งแรก → กำลังดำเนินการ,
-// ลบผลจริงออกหมด → กลับไปกำลังวางแผน
+// ลบผลจริงออกหมด → กลับไปกำลังวางแผน และปิดการเผยแพร่ (กฎ: ต้องมีผลจริงก่อนถึงจะเป็นสาธารณะได้)
 async function syncStatusAfterActual(conn, projectId) {
-  const [[p]] = await conn.query('SELECT status FROM projects WHERE project_id = ?', [projectId]);
+  const [[p]] = await conn.query('SELECT status, user_id FROM projects WHERE project_id = ?', [projectId]);
   const hasActual = await hasActualData(projectId, conn);
   if (hasActual && p.status === 'planning') {
     await conn.query("UPDATE projects SET status = 'in_progress' WHERE project_id = ?", [projectId]);
-  } else if (!hasActual && p.status !== 'planning') {
-    await conn.query("UPDATE projects SET status = 'planning' WHERE project_id = ?", [projectId]);
+  } else if (!hasActual) {
+    if (p.status !== 'planning') {
+      await conn.query("UPDATE projects SET status = 'planning' WHERE project_id = ?", [projectId]);
+    }
+    await conn.query(
+      "DELETE FROM project_access WHERE project_id = ? AND user_id <> ? AND permission_level = 'viewer'",
+      [projectId, p.user_id]
+    );
   }
 }
 
@@ -179,7 +190,7 @@ async function prepareLedgerWrite(req, res, { requireRows }) {
     return null;
   }
   if (LOCKED_STATUSES.includes(project.status)) {
-    badRequest(res, 'โครงการนี้สิ้นสุดแล้ว — เปลี่ยนสถานะเป็น "กำลังดำเนินการ" ก่อนจึงจะแก้ไขข้อมูลได้');
+    badRequest(res, 'โครงการนี้อยู่ในสถานะ Completed — เปลี่ยนสถานะกลับเป็น Actual ก่อนจึงจะแก้ไขข้อมูลได้');
     return null;
   }
 
@@ -201,6 +212,31 @@ async function prepareLedgerWrite(req, res, { requireRows }) {
 // ══════════════════════════════════════════════════════════
 // 1. GET /api/projects — โปรเจกต์ของผู้ใช้ พร้อมตัวชี้วัดสรุป (คำนวณฝั่ง server ด้วยสูตรเดียวกับรายงาน)
 // ══════════════════════════════════════════════════════════
+// เติมตัวชี้วัดสรุป (ROI, ระยะคืนทุน, แผน vs จริง) ให้รายการโครงการ — ดึงยอดรายเดือนของทุกโครงการ
+// ในครั้งเดียว แล้วส่งให้ finance คำนวณทีละโครงการ
+async function withSummaries(projects) {
+  if (projects.length === 0) return [];
+  const [ledgerRows] = await db.query(
+    `SELECT pl.project_id, pl.phase, pl.period_index, pl.category_id,
+            c.category_name, c.category_group, et.is_inflow,
+            SUM(pl.total_value) AS total_value
+     FROM project_ledger pl
+     LEFT JOIN categories c ON pl.category_id = c.category_id
+     LEFT JOIN entry_types et ON pl.type_id = et.type_id
+     WHERE pl.project_id IN (?)
+     GROUP BY pl.project_id, pl.phase, pl.period_index, pl.category_id,
+              c.category_name, c.category_group, et.is_inflow`,
+    [projects.map((p) => p.project_id)]
+  );
+
+  const byProject = new Map();
+  for (const r of ledgerRows) {
+    if (!byProject.has(r.project_id)) byProject.set(r.project_id, []);
+    byProject.get(r.project_id).push(r);
+  }
+  return projects.map((p) => ({ ...p, ...summarizeForList(p, byProject.get(p.project_id) || []) }));
+}
+
 exports.getAllProjects = async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -214,27 +250,7 @@ exports.getAllProjects = async (req, res) => {
       [userId]
     );
 
-    // ดึงยอดรวมรายเดือนของทุกโปรเจกต์ในครั้งเดียว แล้วส่งให้ finance คำนวณทีละโปรเจกต์
-    const [ledgerRows] = await db.query(
-      `SELECT pl.project_id, pl.phase, pl.period_index, pl.category_id,
-              c.category_name, c.category_group, et.is_inflow,
-              SUM(pl.total_value) AS total_value
-       FROM project_ledger pl
-       INNER JOIN projects p ON pl.project_id = p.project_id AND p.user_id = ?
-       LEFT JOIN categories c ON pl.category_id = c.category_id
-       LEFT JOIN entry_types et ON pl.type_id = et.type_id
-       GROUP BY pl.project_id, pl.phase, pl.period_index, pl.category_id,
-                c.category_name, c.category_group, et.is_inflow`,
-      [userId]
-    );
-
-    const byProject = new Map();
-    for (const r of ledgerRows) {
-      if (!byProject.has(r.project_id)) byProject.set(r.project_id, []);
-      byProject.get(r.project_id).push(r);
-    }
-
-    const data = projects.map((p) => ({ ...p, ...summarizeForList(p, byProject.get(p.project_id) || []) }));
+    const data = await withSummaries(projects);
     res.json({ status: 'success', message: 'Projects retrieved successfully', data });
   } catch (error) {
     console.error('[Project] getAllProjects Error:', error);
@@ -278,7 +294,7 @@ exports.getCommunityProjects = async (req, res) => {
        ORDER BY p.created_at DESC`,
       [req.user.userId]
     );
-    res.json({ status: 'success', data: rows });
+    res.json({ status: 'success', data: await withSummaries(rows) });
   } catch (error) {
     console.error('[Project] getCommunityProjects Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to retrieve community projects' });
@@ -363,10 +379,38 @@ exports.updateProject = async (req, res) => {
       if (!EDITABLE_STATUSES.includes(status)) return badRequest(res, 'สถานะโครงการไม่ถูกต้อง');
       const hasActual = await hasActualData(id);
       if (status === 'completed' && !hasActual) {
-        return badRequest(res, 'ต้องบันทึกผลการดำเนินงานจริงก่อน จึงจะปิดโครงการ (สิ้นสุดโครงการ) ได้');
+        return badRequest(res, 'ต้องบันทึกผลการดำเนินงานจริงก่อน จึงจะเปลี่ยนสถานะเป็น Completed ได้');
+      }
+      // in_progress = "Actual" — ระบบตั้งให้เองเมื่อบันทึกผลจริงครั้งแรก ตั้งเองโดยยังไม่มีผลจริงไม่ได้
+      // (ไม่งั้นสถานะโครงการกับข้อมูลจะไม่ตรงกัน: สถานะ Actual แต่ยังแก้ประมาณการได้)
+      if (status === 'in_progress' && !hasActual) {
+        return badRequest(res, 'ต้องบันทึกผลการดำเนินงานจริงก่อน จึงจะเปลี่ยนสถานะเป็น Actual ได้');
       }
       if (status === 'planning' && hasActual) {
-        return badRequest(res, 'โครงการนี้มีผลการดำเนินงานจริงแล้ว จึงกลับไปสถานะกำลังวางแผนไม่ได้');
+        return badRequest(res, 'โครงการนี้มีผลการดำเนินงานจริงแล้ว จึงกลับไปสถานะ Estimated ไม่ได้');
+      }
+    }
+
+    // โครงการที่ปิดแล้ว (Completed) ล็อกตัวเลข — ห้ามเปลี่ยนสิ่งที่กระทบผลการคำนวณ (ประเภทโครงการ
+    // เปลี่ยนวิธีนับผลประโยชน์, ระยะเวลา, เป้า ROI) ถ้าไม่ได้เปิดโครงการกลับมาในคำขอเดียวกัน
+    const staysLocked = LOCKED_STATUSES.includes(status ?? project.status);
+    if (LOCKED_STATUSES.includes(project.status) && staysLocked) {
+      const changed = (incoming, current) =>
+        incoming !== undefined && incoming !== null && incoming !== '' && Number(incoming) !== Number(current);
+      const targetChanged =
+        target_roi_percent !== undefined &&
+        (target_roi_percent === null || target_roi_percent === ''
+          ? project.target_roi_percent != null
+          : Number(target_roi_percent) !== Number(project.target_roi_percent));
+      if (
+        changed(project_type_id, project.project_type_id) ||
+        changed(duration_months, project.duration_months) ||
+        targetChanged
+      ) {
+        return badRequest(
+          res,
+          'โครงการนี้อยู่ในสถานะ Completed — เปลี่ยนประเภทโครงการ ระยะเวลา หรือเป้าหมาย ROI ไม่ได้ (เปิดโครงการอีกครั้งก่อน)'
+        );
       }
     }
 
@@ -493,7 +537,7 @@ async function loadAnalysisProject(projectId, userId) {
 
 async function loadAnalysisRows(projectId) {
   const [rows] = await db.query(
-    `SELECT pl.phase, pl.period_index, pl.category_id, pl.total_value,
+    `SELECT pl.phase, pl.period_index, pl.category_id, pl.total_value, pl.custom_name,
             c.category_name, c.category_group, et.is_inflow
      FROM project_ledger pl
      LEFT JOIN categories c ON pl.category_id = c.category_id

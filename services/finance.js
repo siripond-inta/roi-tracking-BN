@@ -39,23 +39,43 @@ function benefitSourcesFor(method) {
 }
 
 // ROI (%) = (ผลประโยชน์สุทธิ / ต้นทุนรวม) × 100 โดย ผลประโยชน์สุทธิ = ผลประโยชน์รวม − ต้นทุนรวม
-// ต้นทุนเป็น 0 (ยังไม่มีข้อมูลต้นทุน) คืน 0 แทนการหารด้วยศูนย์
+// ต้นทุนเป็น 0 → คำนวณ ROI ไม่ได้ (หารด้วยศูนย์) คืน null ให้หน้าเว็บแสดง "—"
+// (เดิมคืน 0% ทำให้โครงการที่มีแต่ผลประโยชน์ถูกตัดสินว่า "ไม่คุ้มค่า")
 function calcRoi(totalBenefit, totalCost) {
-  if (totalCost <= 0) return 0;
+  if (!(totalCost > 0)) return null;
   return ((totalBenefit - totalCost) / totalCost) * 100;
 }
 
-// ระยะเวลาคืนทุน = เดือนแรกที่กระแสเงินสดสะสมกลับมาไม่ติดลบ หลังจากมีต้นทุนเกิดขึ้นแล้ว
-// กระแสเงินสดสะสมหักเงินลงทุน (INV) ไว้แล้ว การที่มันกลับมา ≥ 0 จึงหมายถึงผลประโยชน์สะสม
-// หักต้นทุนดำเนินงาน ได้ครอบคลุมเงินลงทุนทั้งหมดแล้ว — ใช้ต้นทุนชุดเดียวกับ ROI
-// (เดิมเทียบกับงบประมาณเริ่มต้นแยกต่างหาก ทำให้ขัดกันเอง เช่น ROI 100% แต่ยังขึ้นว่าไม่คืนทุน)
-function findPaybackMonth(monthly) {
-  let cumulativeCost = 0;
-  for (const m of monthly) {
-    cumulativeCost += m.expense;
-    if (cumulativeCost > 0 && m.cumulative >= 0) return m.period;
+const diffOrNull = (a, b) => (a == null || b == null ? null : a - b);
+
+// จุดคุ้มทุนจากกระแสเงินสดสะสม (เดือน แบบมีทศนิยม) — เดือนที่เงินสะสมกลับมาเป็น 0 ครั้งสุดท้าย
+// เทียบกับ paybackMonths (สูตรเฉลี่ย) ซึ่งอาจต่างกันได้เมื่อผลประโยชน์แต่ละเดือนไม่เท่ากัน
+// คืน null ถ้าไม่มีต้นทุน หรือเงินสะสม ณ เดือนสุดท้ายที่มีข้อมูลยังติดลบ (ยังไม่คืนทุน)
+function calcBreakEvenMonth(list, upToPeriod) {
+  const months = list.filter((m) => m.period <= upToPeriod);
+  if (months.length === 0 || !months.some((m) => m.expense > 0)) return null;
+  if (months[months.length - 1].cumulative < 0) return null;
+  let breakEven = null;
+  let prev = 0;
+  for (const m of months) {
+    // เดือนที่ยังไม่มีความเคลื่อนไหวเลย (ก่อนเริ่มจ่าย/รับเงิน) ข้ามไป ไม่นับเป็นจุดคุ้มทุน
+    if (prev === 0 && m.revenue === 0 && m.expense === 0) continue;
+    if (m.cumulative >= 0 && (prev < 0 || breakEven === null)) {
+      if (prev < 0) breakEven = m.period - 1 + -prev / (m.cumulative - prev);
+      else breakEven = m.revenue > 0 ? m.period - 1 + Math.min(1, m.expense / m.revenue) : m.period;
+    }
+    prev = m.cumulative;
   }
-  return null;
+  return breakEven;
+}
+
+// ระยะเวลาคืนทุน (เดือน) = ต้นทุนรวม ÷ ผลประโยชน์เฉลี่ยต่อเดือน
+//   ผลประโยชน์เฉลี่ยต่อเดือน = ผลประโยชน์รวม (ที่นับตามประเภทโครงการ) ÷ จำนวนเดือน
+// ได้เป็นจำนวนเดือนแบบมีทศนิยม เช่น 661,000 ÷ (1,086,000 ÷ 12) = 7.3 เดือน
+// ไม่มีผลประโยชน์ (หรือไม่มีต้นทุน) → คำนวณไม่ได้ คืน null
+function calcPaybackMonths(totalCost, totalBenefit, months) {
+  if (totalCost <= 0 || totalBenefit <= 0 || months <= 0) return null;
+  return totalCost / (totalBenefit / months);
 }
 
 function emptyPhaseMonth() {
@@ -66,7 +86,7 @@ function emptyPhaseMonth() {
  * คำนวณผลทั้งหมดของโครงการหนึ่งโครงการ
  * @param project { duration_months, target_roi_percent, calculation_method }
  * @param rows    ledger แต่ละแถว { phase: 'ESTIMATED'|'ACTUAL', period_index, category_id,
- *                category_name, category_group, is_inflow, total_value }
+ *                category_name, category_group, is_inflow, total_value, custom_name? }
  */
 function analyzeProject(project, rows) {
   const method = project.calculation_method || 'MIXED';
@@ -98,11 +118,13 @@ function analyzeProject(project, rows) {
 
     if (phase === 'ACTUAL') lastActualPeriod = Math.max(lastActualPeriod, period);
 
-    const key = r.category_id;
+    // หมวด "อื่นๆ" แยกตามชื่อที่ผู้ใช้พิมพ์ — ไม่งั้นรายการคนละเรื่องจะถูกรวมเป็นก้อนเดียว
+    const key = r.custom_name ? `${r.category_id}|${r.custom_name}` : r.category_id;
     if (!categories.has(key)) {
       categories.set(key, {
         category_id: r.category_id,
-        category_name: r.category_name,
+        custom_name: r.custom_name || null,
+        category_name: r.custom_name || r.category_name,
         category_group: r.category_group,
         is_inflow: !!Number(r.is_inflow),
         source,
@@ -166,13 +188,15 @@ function analyzeProject(project, rows) {
     const totalRevenue = directRevenue + indirectBenefit;
     const totalExpense = list.reduce((s, m) => s + m.expense, 0);
     // มูลค่าประโยชน์ทางอ้อมเทียบเป็นรายปี = ค่าเฉลี่ยต่อเดือนในช่วงที่มีข้อมูล × 12
+    // (ประมาณการ = ตลอดระยะเวลาโครงการ, ผลจริง = เฉพาะเดือนที่บันทึกผลจริงแล้ว)
     const months = Math.max(1, coveredMonths);
     return {
       totalRevenue,
       totalExpense,
       netProfit: totalRevenue - totalExpense,
       roi: calcRoi(totalRevenue, totalExpense),
-      paybackMonth: findPaybackMonth(list),
+      paybackMonths: calcPaybackMonths(totalExpense, totalRevenue, months),
+      breakEvenMonth: calcBreakEvenMonth(list, months),
       directRevenue,
       indirectBenefit,
       indirectMonthlyAverage: indirectBenefit / months,
@@ -184,10 +208,48 @@ function analyzeProject(project, rows) {
   const estimated = summarize('ESTIMATED', durationMonths);
   const actual = summarize('ACTUAL', lastActualPeriod || durationMonths);
 
+  // แผน "ถึงเดือนเดียวกับผลจริงล่าสุด" — ระหว่างโครงการยังไม่จบ ใช้ตัวนี้เทียบกับผลจริงจะยุติธรรมกว่า
+  // เทียบกับแผนทั้งโครงการ
+  const planToDate = series.ESTIMATED.filter((m) => m.period <= lastActualPeriod);
+  const toDateRevenue = planToDate.reduce((s2, m) => s2 + m.revenue, 0);
+  const toDateExpense = planToDate.reduce((s2, m) => s2 + m.expense, 0);
+  const estimatedToDate = {
+    months: lastActualPeriod,
+    totalRevenue: toDateRevenue,
+    totalExpense: toDateExpense,
+    netProfit: toDateRevenue - toDateExpense,
+    roi: calcRoi(toDateRevenue, toDateExpense),
+    paybackMonths: calcPaybackMonths(toDateExpense, toDateRevenue, lastActualPeriod),
+  };
+
+  // คาดการณ์ทั้งโครงการ = ผลจริงถึงเดือนล่าสุด + แผนของเดือนที่เหลือ
+  // ใช้ตัดสินความคุ้มค่าระหว่างโครงการยังไม่จบ — เป้า ROI ตั้งไว้สำหรับทั้งโครงการ ถ้าเอา ROI ของ
+  // ผลจริงแค่บางเดือน (ที่ลงทุนไปเต็มแล้วแต่ผลประโยชน์ยังมาไม่ครบ) ไปเทียบ จะ "ไม่คุ้มค่า" แทบทุกโครงการ
+  const planRemaining = series.ESTIMATED.filter((m) => m.period > lastActualPeriod);
+  const projRevenue = actual.totalRevenue + planRemaining.reduce((s2, m) => s2 + m.revenue, 0);
+  const projExpense = actual.totalExpense + planRemaining.reduce((s2, m) => s2 + m.expense, 0);
+  const projected = {
+    totalRevenue: projRevenue,
+    totalExpense: projExpense,
+    netProfit: projRevenue - projExpense,
+    roi: calcRoi(projRevenue, projExpense),
+  };
+
+  const isFinal = project.project_status === 'completed' || project.project_status === 'archived';
+  const actualIsPartial = hasActualData && !isFinal && lastActualPeriod < durationMonths;
+
   const targetRoi = project.target_roi_percent != null ? num(project.target_roi_percent) : null;
-  // เทียบกับ ROI จริงถ้ามีข้อมูล Actual แล้ว ถ้ายังไม่มีก็เทียบกับที่คาดการณ์ไว้ (และบอกด้วยว่าใช้ฐานไหน)
-  const worthwhileBasis = hasActualData ? 'actual' : 'estimated';
-  const roiForComparison = hasActualData ? actual.roi : estimated.roi;
+  // ฐานที่ใช้เทียบเป้า: ยังไม่มีผลจริง → ประมาณการ, มีผลจริงครบ/ปิดโครงการแล้ว → ผลจริง,
+  // มีผลจริงบางเดือน → คาดการณ์ทั้งโครงการ (ผลจริง + แผนที่เหลือ)
+  const worthwhileBasis = !hasActualData ? 'estimated' : actualIsPartial ? 'projected' : 'actual';
+  const basisSummary = { estimated, actual, projected }[worthwhileBasis];
+  const roiForComparison = basisSummary.roi;
+  let isWorthwhile = null;
+  if (targetRoi != null) {
+    // ROI คำนวณไม่ได้เพราะไม่มีต้นทุน: มีผลประโยชน์ = คุ้มค่าแน่นอน, ไม่มีอะไรเลย = ยังตัดสินไม่ได้
+    if (roiForComparison == null) isWorthwhile = basisSummary.totalRevenue > 0 ? true : null;
+    else isWorthwhile = roiForComparison >= targetRoi;
+  }
 
   // เทียบผลจริงกับแผน "ถึงเดือนเดียวกัน" ด้วย — ระหว่างโครงการยังไม่จบ ถ้าเทียบกับแผนทั้งโครงการ
   // ทุกหมวดจะดูต่ำกว่าเป้าหมดเพียงเพราะยังบันทึกผลไม่ครบทุกเดือน
@@ -217,16 +279,18 @@ function analyzeProject(project, rows) {
       countedSources: benefitSourcesFor(method),
       estimated,
       actual,
+      estimatedToDate,
+      projected,
       variance: {
         revenue: actual.totalRevenue - estimated.totalRevenue,
         expense: actual.totalExpense - estimated.totalExpense,
         netProfit: actual.netProfit - estimated.netProfit,
-        roi: actual.roi - estimated.roi,
+        roi: diffOrNull(actual.roi, estimated.roi),
       },
       targetRoi,
       roiForComparison,
       worthwhileBasis,
-      isWorthwhile: targetRoi == null ? null : roiForComparison >= targetRoi,
+      isWorthwhile,
     },
     byCategory,
   };
@@ -244,8 +308,22 @@ function summarizeForList(project, rows) {
     total_cost: phase.totalExpense,
     net_profit: phase.netProfit,
     roi: phase.roi,
-    payback_month: phase.paybackMonth,
+    payback_months: phase.paybackMonths,
+    break_even_month: phase.breakEvenMonth,
     is_worthwhile: summary.isWorthwhile,
+    worthwhile_basis: summary.worthwhileBasis,
+    projected_roi: summary.hasActualData ? summary.projected.roi : null,
+    // แผน vs จริง สำหรับหน้า Dashboard
+    has_actual: summary.hasActualData,
+    last_actual_period: summary.lastActualPeriod,
+    estimated_roi: summary.estimated.roi,
+    estimated_net_profit: summary.estimated.netProfit,
+    estimated_payback_months: summary.estimated.paybackMonths,
+    actual_roi: summary.hasActualData ? summary.actual.roi : null,
+    actual_net_profit: summary.hasActualData ? summary.actual.netProfit : null,
+    actual_payback_months: summary.hasActualData ? summary.actual.paybackMonths : null,
+    estimated_to_date_roi: summary.hasActualData ? summary.estimatedToDate.roi : null,
+    estimated_to_date_payback_months: summary.hasActualData ? summary.estimatedToDate.paybackMonths : null,
   };
 }
 
@@ -255,7 +333,8 @@ module.exports = {
   isCounted,
   benefitSourcesFor,
   calcRoi,
-  findPaybackMonth,
+  calcPaybackMonths,
+  calcBreakEvenMonth,
   analyzeProject,
   summarizeForList,
 };
