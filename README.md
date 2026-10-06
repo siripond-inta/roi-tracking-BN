@@ -38,6 +38,9 @@ Notable columns:
   (`REV001`, `BEN002`, …), whether it is an inflow or outflow, and how it is counted (see below).
   `BEN` categories must have `unit_label` + `rate_label` (e.g. "hours saved per month" ×
   "hourly wage").
+- `categories.allow_custom_name` — an "other" category (`REVOTH`, `BENOTH`, `INVOTH`, `OPCOTH`,
+  `ADCOTH`, added by migration `0004`): the user must type the item name, stored in
+  `project_ledger.custom_name`, and reports show that name instead of the category's.
 - `project_types.calculation_method` — `REVENUE`, `COST_SAVING` or `MIXED`.
 - `projects.status` — `planning`, `in_progress`, `completed` (and `archived`).
 - `project_ledger` — one row per project, phase (`ESTIMATED` / `ACTUAL`) and month
@@ -56,17 +59,29 @@ match on every page.
 | Cost | `INV` / `OPC` / `ADC` | amount (THB) per month | always |
 
 - **ROI (%)** = (counted benefit − cost) ÷ cost × 100
-- **Payback month** = first month where the cumulative net cash flow is back to ≥ 0 (after some
-  cost has been incurred)
+- **Payback period (months)** = total cost ÷ (total counted benefit ÷ number of months), shown with
+  one decimal — e.g. 661,000 ÷ (1,086,000 ÷ 12) = 7.3 months. Estimated figures use the project
+  duration; actual figures use the months recorded so far. `null` when there is no benefit yet.
 - **Indirect benefit, annualized** = average monthly indirect benefit × 12
-- **Worthwhile** = ROI ≥ the project's `target_roi_percent` (actual ROI once actual data exists,
-  otherwise estimated)
+- **Break-even month** (`breakEvenMonth`) = the month the cumulative cash flow (the chart) climbs back to 0,
+  interpolated within the month — e.g. 6.2. `null` while cumulative cash is still negative. Shown next to
+  the payback figure because the average-based payback can differ when monthly benefits are uneven.
+- **ROI when there is no cost** = `null` (shown as "—") instead of 0%.
+- **Worthwhile** = ROI ≥ the project's `target_roi_percent`, judged on: the estimate (no actual data yet),
+  the actual figures (all months recorded, or the project is completed), or — while actual data covers only
+  part of the project — the **projected** full-project ROI = actual months so far + plan for the remaining
+  months (`summary.projected`, `worthwhileBasis: 'projected'`). A project with benefit but no cost counts as
+  worthwhile.
 - Benefits that were entered but aren't counted for the project's type are reported separately as
   `excludedBenefit` instead of being silently dropped.
 
 Project status is kept in sync automatically: saving the first actual data moves a project from
-`planning` to `in_progress`, removing all actual data moves it back, `completed` requires actual
-data, and `completed` / `archived` projects reject ledger changes.
+`planning` to `in_progress`, removing all actual data moves it back (and makes it private again),
+`in_progress` / `completed` require actual data, and `completed` / `archived` projects reject ledger
+changes as well as changes to project type, duration and target ROI.
+
+Every authenticated request re-reads the user's role and `is_active` from the database, so a demoted or
+deactivated account loses access immediately instead of when its 24-hour token expires.
 
 ## Entering ledger data
 
@@ -92,9 +107,22 @@ ROI / payback while the user is typing.
 
 ## Tests
 
-```bash
-npm test   # node --test — unit tests for services/finance.js and services/ledger-input.js
-```
+| Level | Tool | Files | Command | Result file |
+|---|---|---|---|---|
+| Unit | Jest | `tests/unit/*.test.js` (finance, ledger input, auth middleware) | `npm run test:unit` | — |
+| Integration (API) | Jest + Supertest | `tests/api/*.test.js` (auth, roles, projects, ledgers, calculations, admin, community) | `npm run test:api` | — |
+| Unit + API with report | Jest | all of the above | `npm run test:report` | `test-reports/backend/jest-report.html`, `test-reports/backend/coverage/index.html` |
+| API (system) | Postman / Newman | `postman/roi-tracking.postman_collection.json` | `npm run test:postman` | `test-reports/postman/newman-report.html` |
+
+- `npm test` runs unit + API tests. Every test name starts with an ID (`IT-AUTH-01`, `IT-CAL-02`, …) so it
+  can be referenced in documentation.
+- The API tests use a **separate database** (`roi_tracking_test`, override with `TEST_DB_NAME`): it is
+  dropped, migrated and seeded on every run using `MYSQL_ROOT_PASSWORD` from `.env`, so they never
+  touch real data. MySQL (`docker compose up -d`) must be running.
+- The Postman collection runs against the **running** backend (`npm run dev`) with the seeded demo
+  accounts; it creates its own test project and deletes it at the end. Import the same file into
+  Postman to run it from the Collection Runner.
+- `test-reports/` is generated and git-ignored.
 
 ### Common commands
 
