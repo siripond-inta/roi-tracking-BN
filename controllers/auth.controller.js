@@ -5,17 +5,35 @@ const db = require('../config/db.config');
 const bcrypt = require('bcryptjs'); // bcryptjs = pure JS ไม่ต้องการ native build (ปลอดภัยกว่าบน Windows)
 const jwt = require('jsonwebtoken');
 
+// ตรวจรูปแบบอีเมลแบบพื้นฐาน (มี @ และโดเมนที่มีจุด ไม่มีช่องว่าง) — ความยาวตามคอลัมน์ VARCHAR(255)
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MIN_PASSWORD_LENGTH = 6;
+const isValidEmail = (email) => typeof email === 'string' && email.length <= 255 && EMAIL_PATTERN.test(email);
+
 // ─────────────────────────────────────────────
 // POST /api/auth/signup — สมัครสมาชิกใหม่
 // ─────────────────────────────────────────────
+exports.isValidEmail = isValidEmail;
+
 exports.signup = async (req, res) => {
   try {
     // หมายเหตุ: schema v1.2 ไม่มีคอลัมน์ users.company_name แล้ว (ถ้า frontend ส่งมาจะถูกละเว้น)
-    const { full_name, email, password } = req.body;
+    const full_name = typeof req.body.full_name === 'string' ? req.body.full_name.trim() : '';
+    const email = typeof req.body.email === 'string' ? req.body.email.trim() : '';
+    const { password } = req.body;
 
-    // 1. ตรวจสอบว่ากรอกข้อมูลครบหรือไม่
+    // 1. ตรวจสอบว่ากรอกข้อมูลครบและถูกรูปแบบหรือไม่ (ตรวจที่ server ด้วย ไม่พึ่ง frontend อย่างเดียว)
     if (!full_name || !email || !password) {
       return res.status(400).json({ message: 'กรุณากรอกข้อมูลให้ครบทุกช่อง' });
+    }
+    if (full_name.length > 255) {
+      return res.status(400).json({ message: 'ชื่อยาวเกิน 255 ตัวอักษร' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ message: 'รูปแบบอีเมลไม่ถูกต้อง' });
+    }
+    if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ message: `Password ต้องมีอย่างน้อย ${MIN_PASSWORD_LENGTH} ตัวอักษร` });
     }
 
     // 2. ตรวจสอบว่า email ซ้ำกับในระบบหรือไม่
@@ -133,6 +151,12 @@ exports.updateProfile = async (req, res) => {
     }
 
     const emailChanged = email && email.trim() !== user.email;
+    if (emailChanged && !isValidEmail(email.trim())) {
+      return res.status(400).json({ message: 'รูปแบบอีเมลไม่ถูกต้อง' });
+    }
+    if (full_name.trim().length > 255) {
+      return res.status(400).json({ message: 'ชื่อยาวเกิน 255 ตัวอักษร' });
+    }
 
     // เปลี่ยนอีเมลต้องยืนยันด้วยรหัสผ่านปัจจุบัน (ป้องกันคนอื่นแอบเปลี่ยนถ้า session หลุด)
     if (emailChanged) {
@@ -184,8 +208,8 @@ exports.changePassword = async (req, res) => {
     if (!current_password || !new_password) {
       return res.status(400).json({ message: 'กรุณากรอกรหัสผ่านปัจจุบันและรหัสผ่านใหม่' });
     }
-    if (new_password.length < 6) {
-      return res.status(400).json({ message: 'รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร' });
+    if (typeof new_password !== 'string' || new_password.length < MIN_PASSWORD_LENGTH) {
+      return res.status(400).json({ message: `รหัสผ่านใหม่ต้องมีอย่างน้อย ${MIN_PASSWORD_LENGTH} ตัวอักษร` });
     }
 
     const [[user]] = await db.query('SELECT * FROM users WHERE user_id = ?', [userId]);

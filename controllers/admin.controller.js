@@ -93,13 +93,16 @@ exports.updateUser = async (req, res) => {
       return res.status(400).json({ status: 'error', message: 'Role ไม่ถูกต้อง' });
     }
 
-    await db.query(
+    const [result] = await db.query(
       `UPDATE users SET
         full_name = COALESCE(?, full_name),
         role = COALESCE(?, role)
        WHERE user_id = ?`,
       [full_name || null, role || null, id]
     );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ status: 'error', message: 'ไม่พบ User' });
+    }
 
     res.json({ status: 'success', message: 'อัปเดตข้อมูล User สำเร็จ' });
   } catch (error) {
@@ -151,31 +154,47 @@ exports.softDeleteUser = async (req, res) => {
 // 4. DELETE /api/admin/users/:id — ลบ User และโปรเจกต์ทั้งหมดของ User นั้น
 // ══════════════════════════════════════════════════════════
 exports.deleteUser = async (req, res) => {
-  try {
-    const { id } = req.params;
+  const { id } = req.params;
 
-    // ห้ามลบตัวเอง
-    if (Number(id) === req.user.userId) {
-      return res.status(400).json({ status: 'error', message: 'ไม่สามารถลบบัญชีตัวเองได้' });
+  // ห้ามลบตัวเอง
+  if (Number(id) === req.user.userId) {
+    return res.status(400).json({ status: 'error', message: 'ไม่สามารถลบบัญชีตัวเองได้' });
+  }
+
+  let conn;
+  try {
+    const [[existing]] = await db.query('SELECT user_id FROM users WHERE user_id = ?', [id]);
+    if (!existing) {
+      return res.status(404).json({ status: 'error', message: 'ไม่พบ User' });
     }
+
+    // ลบหลายตารางต่อเนื่องกัน — ทำใน transaction เดียว ถ้าขั้นไหนพังจะไม่เหลือข้อมูลครึ่งๆ กลางๆ
+    conn = await db.getConnection();
+    await conn.beginTransaction();
 
     // ลบ ledger/access ของโปรเจกต์ที่เป็นเจ้าของ → projects → access ที่ user นี้เกี่ยวข้อง (ในฐานะ
     // viewer/editor ของโปรเจกต์คนอื่น หรือเป็นคนแชร์ให้คนอื่น) → user ตามลำดับ FK
-    await db.query(
+    await conn.query(
       'DELETE pl FROM project_ledger pl INNER JOIN projects p ON pl.project_id = p.project_id WHERE p.user_id = ?',
       [id]
     );
-    await db.query(
+    await conn.query(
       'DELETE pa FROM project_access pa INNER JOIN projects p ON pa.project_id = p.project_id WHERE p.user_id = ?',
       [id]
     );
-    await db.query('DELETE FROM projects WHERE user_id = ?', [id]);
-    await db.query('DELETE FROM project_access WHERE user_id = ? OR shared_by = ?', [id, id]);
-    await db.query('DELETE FROM users WHERE user_id = ?', [id]);
+    await conn.query('DELETE FROM projects WHERE user_id = ?', [id]);
+    await conn.query('DELETE FROM project_access WHERE user_id = ? OR shared_by = ?', [id, id]);
+    // ledger ของโครงการคนอื่นที่ user นี้เคยเป็นคนบันทึก — คงข้อมูลไว้ แค่ล้างชื่อผู้บันทึก (FK)
+    await conn.query('UPDATE project_ledger SET created_by = NULL WHERE created_by = ?', [id]);
+    await conn.query('DELETE FROM users WHERE user_id = ?', [id]);
+    await conn.commit();
 
     res.json({ status: 'success', message: 'ลบ User สำเร็จ' });
   } catch (error) {
+    if (conn) await conn.rollback().catch(() => {});
     console.error('[Admin] deleteUser Error:', error);
     res.status(500).json({ status: 'error', message: 'Failed to delete user' });
+  } finally {
+    if (conn) conn.release();
   }
 };

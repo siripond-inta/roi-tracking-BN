@@ -65,9 +65,31 @@ exports.update = async (req, res) => {
       return res.status(400).json({ status: 'error', message: 'calculation_method ไม่ถูกต้อง' });
     }
 
-    const [[existing]] = await db.query('SELECT type_id FROM project_types WHERE type_id = ?', [id]);
+    const [[existing]] = await db.query(
+      'SELECT type_id, description, calculation_method FROM project_types WHERE type_id = ?',
+      [id]
+    );
     if (!existing) {
       return res.status(404).json({ status: 'error', message: 'ไม่พบประเภทโครงการนี้' });
+    }
+    if (type_name !== undefined && (typeof type_name !== 'string' || !type_name.trim())) {
+      return res.status(400).json({ status: 'error', message: 'กรุณากรอกชื่อประเภทโครงการ' });
+    }
+
+    // ฟิลด์ที่ไม่ได้ส่งมา (undefined) = คงค่าเดิม — กัน PUT ที่ส่งมาแค่บางฟิลด์ลบค่าอื่นทิ้ง
+    const nextDescription = description === undefined ? existing.description : description || null;
+    const nextMethod = calculation_method === undefined ? existing.calculation_method : calculation_method || null;
+
+    // เปลี่ยนวิธีคำนวณของประเภทที่มีโครงการใช้อยู่ = ROI ของทุกโครงการประเภทนี้เปลี่ยนเงียบๆ
+    // (รวมโครงการที่ปิดไปแล้ว) จึงไม่อนุญาต — ให้สร้างประเภทใหม่แทน
+    if ((nextMethod || null) !== (existing.calculation_method || null)) {
+      const [[{ usedBy }]] = await db.query('SELECT COUNT(*) AS usedBy FROM projects WHERE project_type_id = ?', [id]);
+      if (usedBy > 0) {
+        return res.status(400).json({
+          status: 'error',
+          message: `เปลี่ยนวิธีคำนวณไม่ได้ — มีโครงการใช้ประเภทนี้อยู่ ${usedBy} โครงการ (สร้างประเภทใหม่แทน)`,
+        });
+      }
     }
 
     await db.query(
@@ -76,7 +98,7 @@ exports.update = async (req, res) => {
          description = ?,
          calculation_method = ?
        WHERE type_id = ?`,
-      [type_name ? type_name.trim() : null, description || null, calculation_method || null, id]
+      [type_name ? type_name.trim() : null, nextDescription, nextMethod, id]
     );
 
     res.json({ status: 'success', message: 'แก้ไขประเภทโครงการสำเร็จ' });

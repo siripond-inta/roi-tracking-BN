@@ -9,7 +9,10 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  // คอลัมน์ DATE (เช่น transaction_date) ส่งกลับเป็น 'YYYY-MM-DD' ตรงๆ — ถ้าแปลงเป็น JS Date
+  // จะถูกตีความเป็นเที่ยงคืนเวลาเครื่อง (UTC+7) แล้วออกมาเป็นวันก่อนหน้าใน JSON (เช่น 15 → 14T17:00Z)
+  dateStrings: ['DATE']
 });
 
 // แปลงให้รองรับ Promise (async/await)
